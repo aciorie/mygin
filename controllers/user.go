@@ -22,7 +22,13 @@ func (e *AppError) Error() string {
 func CreateUser(c *gin.Context) {
 	var user models.User
 	if err := c.ShouldBindJSON(&user); err != nil {
-		c.Error(&AppError{Code: http.StatusBadRequest, Message: "Invalid request body"})
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"message": "Invalid request body"})
+		return
+	}
+
+	// Explicitly verify that the password is empty
+	if user.Password == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"message": "Password cannot be empty"})
 		return
 	}
 
@@ -30,14 +36,14 @@ func CreateUser(c *gin.Context) {
 	var existingUser models.User
 	result := database.DB.Where("username = ?", user.Username).First(&existingUser)
 	if result.RowsAffected > 0 {
-		c.Error(&AppError{Code: http.StatusConflict, Message: "Username already exists"})
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{"message": "Username already exists"})
 		return
 	}
 
 	// Encode password
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
 	if err != nil {
-		c.Error(&AppError{http.StatusInternalServerError, "Could not hash password"})
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"message": "Could not hash password"})
 		return
 	}
 	user.Password = string(hashedPassword)
@@ -45,7 +51,7 @@ func CreateUser(c *gin.Context) {
 	// Create users
 	result = database.DB.Create(&user)
 	if result.Error != nil {
-		c.Error(result.Error) // Append gorm errors directly to c.Errors
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"message": "Internal Server Error: " + result.Error.Error()})
 		return
 	}
 
