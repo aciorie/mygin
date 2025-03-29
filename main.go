@@ -176,31 +176,10 @@ func main() {
 	r := gin.New() // Use gin.New() to avoid default middlewares interfering
 	r.Use(MyLogger(logger))
 
-	// Initialize JWT middleware.
-	authMiddleware := auth.AuthMiddleware() // No error check needed as currently implemented
-
 	// Register user related routes
 	r.POST("/users", controllers.CreateUser)
 	r.POST("/login", auth.LoginHandler) // Use the LoginHandler
 
-	// Create a group for protected routes.
-	protected := r.Group("/api")
-	protected.Use(authMiddleware) // Apply the JWT middleware to the group.
-	{
-		protected.GET("/profile", func(c *gin.Context) {
-			// Access user information set by the middleware.
-			userID := c.GetUint("user_id")
-			username := c.GetString("username")
-
-			c.JSON(http.StatusOK, gin.H{
-				"user_id":  userID,
-				"username": username,
-				"message":  "This is a protected route!",
-			})
-		})
-	}
-
-	// Unprotected routes (for demonstration purposes)
 	r.GET("/hello", func(c *gin.Context) {
 		c.String(http.StatusOK, "Hello Gin!")
 	})
@@ -235,6 +214,7 @@ func main() {
 	})
 
 	r.Use(ErrorHandler()) // Custom error handler *after* other middleware.
+
 	// Use the port number in the configuration
 	addr := fmt.Sprintf(":%d", config.AppConfig.Port)
 	if err := r.Run(addr); err != nil {
