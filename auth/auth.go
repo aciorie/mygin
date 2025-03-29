@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"errors"
 	"fmt"
 	"mygin/database"
 	"mygin/models"
@@ -11,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v4"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
 )
 
 // mySigningKey should be a strong, randomly generated secret key,
@@ -145,4 +147,40 @@ func LoginHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"token": token})
+}
+
+// UserHasPermissions checks if the user has all required permissions
+func UserHasPermissions(userID uint, requiredPermissions ...string) (bool, error) {
+	if len(requiredPermissions) == 0 {
+		return true, nil
+	}
+
+	var user models.User
+	// Preload Roles and Permissions for checking
+	err := database.DB.Preload("Roles.Permissions").First(&user, userID).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// If the user is not found, it is also considered as no permission, but a specific signal or false is returned
+			return false, fmt.Errorf("user with ID %d not found", userID)
+		}
+		return false, fmt.Errorf("database error checking permissions for user %d: %w", userID, err)
+	}
+
+	// Put all permissions that the user has into a map for quick lookup
+	userPermissions := make(map[string]struct{})
+
+	for _, role := range user.Roles {
+		for _, perm := range role.Permissions {
+			userPermissions[perm.Name] = struct{}{}
+		}
+	}
+
+	// Check if the user has all required permissions
+	for _, reqPerm := range requiredPermissions {
+		if _, ok := userPermissions[reqPerm]; !ok {
+			// If any of the required permissions are not in the user's permissions set, return false
+			return false, nil
+		}
+	}
+	return true, nil
 }
