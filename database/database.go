@@ -16,7 +16,7 @@ import (
 
 var DB *gorm.DB
 
-func InitDB() {
+func InitDB() *gorm.DB {
 	databaseSignal := config.AppConfig.DatabaseURL
 
 	// GORM logger configuration
@@ -49,6 +49,7 @@ func InitDB() {
 
 	// Seed initial roles and permissions if they don't exist
 	SeedInitialData(DB) // Call the seeding function
+	return db
 }
 
 // SeedInitialData seeds the database with initial roles and permissions

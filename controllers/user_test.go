@@ -7,6 +7,7 @@ import (
 	"mygin/auth"
 	"mygin/database"
 	"mygin/models"
+	"mygin/services"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -156,21 +157,27 @@ func setupTestDB() *gorm.DB {
 }
 
 // setupRouter sets up a Gin engine and necessary routes for testing
-func setupRouter() *gin.Engine {
+func setupRouter(userService services.UserService) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 
+	// Create a UserController instance, passing in the UserService
+	userController := NewUserController(userService)
+
+	//Register /register route
+	r.POST("/register", userController.CreateUser)
+
 	// Register user controller related routes
-	r.POST("/users", CreateUser)
+	// r.POST("/users", CreateUser)
 	// Add routes to be tested
 	// Note: Routes that require authentication are usually placed in a Group and AuthMiddleware is applied
 	// For simplicity, register directly here, but you still need to manually simulate the authentication process (add Token) when testing
 	userRoutes := r.Group("/users")
 	userRoutes.Use(auth.AuthMiddleware()) // Apply authentication middleware to routes under /users
 	{
-		userRoutes.GET("/:id", GetUserByID)
-		userRoutes.PUT("/:id", UpdateUser)
-		userRoutes.GET("", ListUsers) // GET /users
+		userRoutes.GET("/:id", userController.GetUserByID)
+		userRoutes.PUT("/:id", userController.UpdateUser)
+		userRoutes.GET("", userController.ListUsers) // GET /users
 		// If there is DeleteUser, also add userRoutes.DELETE("/:id", DeleteUser) here
 	}
 
@@ -181,7 +188,14 @@ func setupRouter() *gin.Engine {
 func TestMain(m *testing.M) {
 	// Setting up a global test router
 	fmt.Println("Setting up test router...") // Add log to confirm execution
-	testRouter = setupRouter()
+	db := setupTestDB()
+	userService := services.NewUserService(db)
+	testRouter := setupRouter(userService)
+
+	// Print the routes
+	for _, route := range testRouter.Routes() {
+		fmt.Printf("Path: %s, Method: %s, Handler: %s\n", route.Path, route.Method, route.Handler)
+	}
 
 	// Run all tests in a package
 	exitCode := m.Run()
@@ -193,13 +207,14 @@ func TestMain(m *testing.M) {
 // TestCreateUser tests the user creation function
 func TestCreateUser(t *testing.T) {
 	// Each test function gets its own routing instance
-	r := testRouter
+	db := setupTestDB()
+	userService := services.NewUserService(db)
+	r := setupRouter(userService)
 	assert.NotNil(t, r, "Test router should not be nil") // Make sure testRouter is initialized
 
 	// --- Test Case 1: Successfully created user ---
 	t.Run("Success", func(t *testing.T) {
 		// Get a new database connection for each test case
-		db := setupTestDB()
 		sqlDB, _ := db.DB()
 		defer sqlDB.Close() // Close the database connection after the test is completed
 
@@ -224,7 +239,7 @@ func TestCreateUser(t *testing.T) {
 		reqBody, _ := json.Marshal(userInput)
 
 		// Build a HTTP request
-		req, _ := http.NewRequest(http.MethodPost, "/users", bytes.NewBuffer(reqBody))
+		req, _ := http.NewRequest(http.MethodPost, "/register", bytes.NewBuffer(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 
 		// Execute the request
@@ -279,7 +294,7 @@ func TestCreateUser(t *testing.T) {
 		reqBody, _ := json.Marshal(userInput)
 
 		// Create and execute the request
-		req, _ := http.NewRequest(http.MethodPost, "/users", bytes.NewBuffer(reqBody))
+		req, _ := http.NewRequest(http.MethodPost, "/register", bytes.NewBuffer(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
@@ -320,7 +335,7 @@ func TestCreateUser(t *testing.T) {
 		}
 		reqBody, _ := json.Marshal(userInput)
 
-		req, _ := http.NewRequest(http.MethodPost, "/users", bytes.NewBuffer(reqBody))
+		req, _ := http.NewRequest(http.MethodPost, "/register", bytes.NewBuffer(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
@@ -350,7 +365,7 @@ func TestCreateUser(t *testing.T) {
 		// Prepare the request body for a missing password
 		reqBody := []byte(`{"username": "testuser_invalid", "email": "invalid@example.com"}`)
 
-		req, _ := http.NewRequest(http.MethodPost, "/users", bytes.NewBuffer(reqBody))
+		req, _ := http.NewRequest(http.MethodPost, "/register", bytes.NewBuffer(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
@@ -388,7 +403,7 @@ func TestCreateUser(t *testing.T) {
 		}
 		reqBody, _ := json.Marshal(userInput)
 
-		req, _ := http.NewRequest(http.MethodPost, "/users", bytes.NewBuffer(reqBody))
+		req, _ := http.NewRequest(http.MethodPost, "/register", bytes.NewBuffer(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
@@ -422,14 +437,12 @@ UpdateUser, GetUserByID and ListUsers:
 
 // TestUpdateUser Test update user information
 func TestUpdateUser(t *testing.T) {
-	r := setupRouter()
+	db := setupTestDB()
+	userService := services.NewUserService(db)
+	r := setupRouter(userService)
 
 	// --- Test Case: Successfully updated my information (nickname and email) ---
 	t.Run("Success - Update Self Nickname and Email", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
-
 		tx := db.Begin()
 		originalDB := database.DB
 		database.DB = tx
@@ -439,8 +452,10 @@ func TestUpdateUser(t *testing.T) {
 		}()
 
 		// Prepare users and tokens (requires users:update:self permission)
-		testUser, err := createTestUserWithRoles(tx, "updateuser", "password", "update@example.com", "test_user_role")
-		assert.NoError(t, err)
+		testUser := models.User{Username: "updateuser", Password: "password", Email: "update@example.com"}
+		result := tx.Create(&testUser)
+		assert.NoError(t, result.Error)
+		assert.NotZero(t, testUser.ID)
 		token, err := generateTokenForUser(testUser)
 		assert.NoError(t, err)
 
@@ -475,9 +490,6 @@ func TestUpdateUser(t *testing.T) {
 
 	// --- Test Case: Successfully updated own password ---
 	t.Run("Success - Update Self Password", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
 		tx := db.Begin()
 		originalDB := database.DB
 		database.DB = tx
@@ -512,16 +524,13 @@ func TestUpdateUser(t *testing.T) {
 
 	// --- Test Case: Administrator successfully updates other user information ---
 	t.Run("Success - Admin Update Other User", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
 		tx := db.Begin()
 		originalDB := database.DB
 		database.DB = tx
 		defer func() { tx.Rollback(); database.DB = originalDB }()
 
 		// Create administrator and target user
-		adminUser, err := createTestUserWithRoles(tx, "adminupdater", "password", "admin@update.com", "test_admin_role") // 需要 users:update:all
+		adminUser, err := createTestUserWithRoles(tx, "adminupdater", "password", "admin@update.com", "test_admin_role") // need users:update:all
 		assert.NoError(t, err)
 		targetUser, err := createTestUserWithRoles(tx, "targetuser", "password", "target@update.com", "test_user_role")
 		assert.NoError(t, err)
@@ -548,16 +557,13 @@ func TestUpdateUser(t *testing.T) {
 
 	// --- Test Case: Failure - Tried to update other people's information but didn't have permission ---
 	t.Run("Failure - Update Other No Permission", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
 		tx := db.Begin()
 		originalDB := database.DB
 		database.DB = tx
 		defer func() { tx.Rollback(); database.DB = originalDB }()
 
 		// Create normal users A and B
-		userA, err := createTestUserWithRoles(tx, "userA_update", "password", "a@update.com", "test_user_role") // 只有 update:self
+		userA, err := createTestUserWithRoles(tx, "userA_update", "password", "a@update.com", "test_user_role") // only have update:self
 		assert.NoError(t, err)
 		userB, err := createTestUserWithRoles(tx, "userB_update", "password", "b@update.com", "test_user_role")
 		assert.NoError(t, err)
@@ -580,9 +586,6 @@ func TestUpdateUser(t *testing.T) {
 
 	// --- Test Case: Failure - updating a non-existent user ---
 	t.Run("Failure - User Not Found", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
 		tx := db.Begin()
 		originalDB := database.DB
 		database.DB = tx
@@ -609,9 +612,6 @@ func TestUpdateUser(t *testing.T) {
 
 	//--- Test Case: Failure - Email Conflict ---
 	t.Run("Failure - Email Conflict", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
 		tx := db.Begin()
 		originalDB := database.DB
 		database.DB = tx
@@ -643,9 +643,6 @@ func TestUpdateUser(t *testing.T) {
 
 	// --- Test Case: Failed - Token not provided ---
 	t.Run("Failure - No Auth Token", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
 		tx := db.Begin()
 		originalDB := database.DB
 		database.DB = tx
@@ -672,13 +669,12 @@ func TestUpdateUser(t *testing.T) {
 
 // TestGetUserByID Test to obtain single user information
 func TestGetUserByID(t *testing.T) {
-	r := setupRouter()
+	db := setupTestDB()
+	userService := services.NewUserService(db)
+	r := setupRouter(userService)
 
 	// --- Test Case: Successfully obtain your own information ---
 	t.Run("Success - Read Self", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
 		tx := db.Begin()
 		originalDB := database.DB
 		database.DB = tx
@@ -706,9 +702,6 @@ func TestGetUserByID(t *testing.T) {
 
 	// --- Test Case: Successfully obtain other people's information (requires users:read:all) ---
 	t.Run("Success - Read Other With Permission", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
 		tx := db.Begin()
 		originalDB := database.DB
 		database.DB = tx
@@ -739,9 +732,6 @@ func TestGetUserByID(t *testing.T) {
 
 	// --- Test Case: Failed - Tried to get other people's information but didn't have permission ---
 	t.Run("Failure - Read Other No Permission", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
 		tx := db.Begin()
 		originalDB := database.DB
 		database.DB = tx
@@ -766,9 +756,6 @@ func TestGetUserByID(t *testing.T) {
 
 	// --- Test Case: Failed - Tried to get self information but did not have read:self permission ---
 	t.Run("Failure - Read Self No Permission", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
 		tx := db.Begin()
 		originalDB := database.DB
 		database.DB = tx
@@ -790,9 +777,6 @@ func TestGetUserByID(t *testing.T) {
 
 	// --- Test Case: Failure - Get a non-existent user ---
 	t.Run("Failure - User Not Found", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
 		tx := db.Begin()
 		originalDB := database.DB
 		database.DB = tx
@@ -824,17 +808,23 @@ func TestGetUserByID(t *testing.T) {
 
 // TestListUsers Test to get the user list (pagination)
 func TestListUsers(t *testing.T) {
-	r := setupRouter()
+	db := setupTestDB()
+	userService := services.NewUserService(db)
+	r := setupRouter(userService)
+	defer func() {
+		sqlDB, _ := db.DB()
+		sqlDB.Close()
+	}()
 
 	// --- Test Case: Successfully obtain the user list (requires users:list permission) ---
 	t.Run("Success - List Users With Permission", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
 		tx := db.Begin()
 		originalDB := database.DB
 		database.DB = tx
-		defer func() { tx.Rollback(); database.DB = originalDB }()
+		defer func() {
+			tx.Rollback()
+			database.DB = originalDB
+		}()
 
 		// Create a user with list permission
 		listUser, err := createTestUserWithRoles(tx, "listuser", "password", "list@example.com", "test_admin_role") // admin role has 'users:list'
@@ -884,9 +874,6 @@ func TestListUsers(t *testing.T) {
 
 	// --- Test Case: Successfully obtain the user list - test paging ---
 	t.Run("Success - List Users Pagination", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
 		tx := db.Begin()
 		originalDB := database.DB
 		database.DB = tx
@@ -937,9 +924,6 @@ func TestListUsers(t *testing.T) {
 
 	// --- Test Case: Failure - Tried to get list but no permission ---
 	t.Run("Failure - List Users No Permission", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
 		tx := db.Begin()
 		originalDB := database.DB
 		database.DB = tx

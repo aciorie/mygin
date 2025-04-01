@@ -6,6 +6,7 @@ import (
 	"mygin/config"
 	"mygin/controllers"
 	"mygin/database"
+	"mygin/services"
 	"net/http"
 	"strings"
 	"time"
@@ -109,20 +110,22 @@ func main() {
 	}
 	defer logger.Sync() // Make sure the buffer is flushed before the program exits
 
-	database.InitDB()
+	db := database.InitDB()
+	userService := services.NewUserService(db)
+	userController := controllers.NewUserController(userService)
 
 	r := gin.New() // Use gin.New() to avoid default middlewares interfering
 	r.Use(MyLogger(logger))
 	r.Use(gin.Recovery()) // Default recovery middleware AFTER logger
 
 	// --- Public Routes ---
-	r.POST("/register", controllers.CreateUser) // Changed from /users for clarity
+	r.POST("/register", userController.CreateUser) // Changed from /users for clarity
 
 	r.GET("/", func(c *gin.Context) {
 		c.String(http.StatusOK, "Hello, World!")
 	})
 	// Register user related routes
-	r.POST("/users", controllers.CreateUser)
+	// r.POST("/users", userController.CreateUser)
 	r.POST("/login", auth.LoginHandler) // Use the LoginHandler
 
 	r.GET("/hello", func(c *gin.Context) {
@@ -157,6 +160,16 @@ func main() {
 			"nick":    nick,
 		})
 	})
+
+	userRoutes := r.Group("/users")
+	userRoutes.Use(auth.AuthMiddleware()) // Apply authentication middleware to routes under /users
+	{
+		userRoutes.GET("/:id", userController.GetUserByID)
+		userRoutes.PUT("/:id", userController.UpdateUser)
+		userRoutes.GET("", userController.ListUsers)   // GET /users
+		r.POST("/register", userController.CreateUser) // Add register route
+		// If there is DeleteUser, also add userRoutes.DELETE("/:id", DeleteUser) here
+	}
 
 	r.Use(ErrorHandler()) // Custom error handler *after* other middleware.
 
