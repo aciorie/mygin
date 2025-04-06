@@ -400,7 +400,6 @@ func TestCreateUser(t *testing.T) {
 
 // TestUpdateUser Test update user information
 func TestUpdateUser(t *testing.T) {
-
 	// --- Test Case: Successfully updated my information (nickname and email) ---
 	t.Run("Success - Update Self Nickname and Email", func(t *testing.T) {
 		tx := baseDB.Begin()
@@ -638,7 +637,6 @@ func TestUpdateUser(t *testing.T) {
 
 // TestGetUserByID Test to obtain single user information
 func TestGetUserByID(t *testing.T) {
-
 	// --- Test Case: Successfully obtain your own information ---
 	t.Run("Success - Read Self", func(t *testing.T) {
 		tx := baseDB.Begin()
@@ -806,7 +804,6 @@ func TestGetUserByID(t *testing.T) {
 
 // TestListUsers Test to get the user list (pagination)
 func TestListUsers(t *testing.T) {
-
 	// --- Test Case: Successfully obtain the user list (requires users:list permission) ---
 	t.Run("Success - List Users With Permission", func(t *testing.T) {
 		tx := baseDB.Begin()
