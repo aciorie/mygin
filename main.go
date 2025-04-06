@@ -6,6 +6,7 @@ import (
 	"mygin/config"
 	"mygin/controllers"
 	"mygin/database"
+	"mygin/repositories"
 	"mygin/services"
 	"net/http"
 	"strings"
@@ -64,13 +65,6 @@ func ErrorHandler() gin.HandlerFunc {
 	}
 }
 
-// @title MyGin API
-// @version 1.0
-// @description This is a sample API built with Gin.
-
-// @host localhost:8080
-// @BasePath /
-
 // Custom Logger Middleware
 func MyLogger(logger *zap.Logger) gin.HandlerFunc {
 	return func(ctx *gin.Context) {
@@ -111,7 +105,9 @@ func main() {
 	defer logger.Sync() // Make sure the buffer is flushed before the program exits
 
 	db := database.InitDB()
-	userService := services.NewUserService(db)
+	userRepository := repositories.NewUserRepository(db)
+	// Correctly pass the UserRepository implementation to NewUserService
+	userService := services.NewUserService(userRepository)
 	userController := controllers.NewUserController(userService)
 
 	r := gin.New() // Use gin.New() to avoid default middlewares interfering
@@ -125,7 +121,7 @@ func main() {
 		c.String(http.StatusOK, "Hello, World!")
 	})
 	// Register user related routes
-	// r.POST("/users", userController.CreateUser)
+	r.POST("/users", userController.CreateUser)
 	r.POST("/login", auth.LoginHandler) // Use the LoginHandler
 
 	r.GET("/hello", func(c *gin.Context) {
@@ -166,8 +162,7 @@ func main() {
 	{
 		userRoutes.GET("/:id", userController.GetUserByID)
 		userRoutes.PUT("/:id", userController.UpdateUser)
-		userRoutes.GET("", userController.ListUsers)   // GET /users
-		r.POST("/register", userController.CreateUser) // Add register route
+		userRoutes.GET("", userController.ListUsers) // GET /users
 		// If there is DeleteUser, also add userRoutes.DELETE("/:id", DeleteUser) here
 	}
 

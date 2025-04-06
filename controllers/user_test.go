@@ -7,6 +7,7 @@ import (
 	"mygin/auth"
 	"mygin/database"
 	"mygin/models"
+	"mygin/repositories"
 	"mygin/services"
 	"net/http"
 	"net/http/httptest"
@@ -19,16 +20,16 @@ import (
 	"github.com/stretchr/testify/assert"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
-var r *gin.Engine
-
-// Global variables store test router instances
-var testRouter *gin.Engine
+// Global variables are only used to store the underlying in-memory database instance
+var baseDB *gorm.DB
 
 // ------Helper function------
 // Helper: Create a user with the specified role (password will be hashed)
-func createTestUserWithRoles(db *gorm.DB, username, password, email string, roleNames ...string) (models.User, error) {
+// IMPORTANT: This helper now accepts a *gorm.DB (which should be the transaction tx)
+func createTestUserWithRoles(tx *gorm.DB, username, password, email string, roleNames ...string) (models.User, error) {
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return models.User{}, fmt.Errorf("failed to hash password: %w", err)
@@ -40,94 +41,96 @@ func createTestUserWithRoles(db *gorm.DB, username, password, email string, role
 		Email:    email,
 	}
 
-	if err := db.Create(&user).Error; err != nil {
+	// Use the transaction to create the user
+	if err := tx.Create(&user).Error; err != nil {
 		return models.User{}, fmt.Errorf("failed to create user %s: %w", username, err)
 	}
 
 	if len(roleNames) > 0 {
 		var roles []models.Role
-		if err := db.Where("name IN ?", roleNames).Find(&roles).Error; err != nil {
+		// Use the transaction to find roles
+		if err := tx.Where("name IN ?", roleNames).Find(&roles).Error; err != nil {
 			return user, fmt.Errorf("failed to find roles %v: %w", roleNames, err)
 		}
 		if len(roles) > 0 {
-			if err := db.Model(&user).Association("Roles").Append(roles); err != nil {
+			// Use the transaction to associate roles
+			if err := tx.Model(&user).Association("Roles").Append(roles); err != nil {
 				return user, fmt.Errorf("failed to associate roles with user %s: %w", username, err)
 			}
 		} else {
 			fmt.Printf("Warning: Roles %v not found for user %s\n", roleNames, username)
 		}
 	}
-	// Users need to be reloaded to include associated roles
-	db.Preload("Roles").First(&user, user.ID)
+	// Users need to be reloaded within the same transaction to include associated roles
+	tx.Preload("Roles").First(&user, user.ID)
 	return user, nil
 }
 
 // Helper: Create a role with specified permissions
-func createTestRoleWithPermissions(db *gorm.DB, roleName, description string, permissionNames ...string) (models.Role, error) {
+// IMPORTANT: This helper now accepts a *gorm.DB (which should be the transaction tx)
+func createTestRoleWithPermissions(tx *gorm.DB, roleName, description string, permissionNames ...string) (models.Role, error) {
 	role := models.Role{
 		Name:        roleName,
 		Description: description,
 	}
-	// Try to find or create a role
-	if err := db.Where(models.Role{Name: roleName}).FirstOrCreate(&role).Error; err != nil {
+	// Use the transaction to find or create a role
+	if err := tx.Where(models.Role{Name: roleName}).FirstOrCreate(&role).Error; err != nil {
 		return models.Role{}, fmt.Errorf("failed to find or create role %s: %w", roleName, err)
 	}
 
 	if len(permissionNames) > 0 {
 		var permissions []models.Permission
-		// Make sure permissions exist
+		// Use the transaction to ensure permissions exist
 		for _, pName := range permissionNames {
 			perm := models.Permission{Name: pName}
-			if err := db.Where(models.Permission{Name: pName}).FirstOrCreate(&perm).Error; err != nil {
+			if err := tx.Where(models.Permission{Name: pName}).FirstOrCreate(&perm).Error; err != nil {
 				return role, fmt.Errorf("failed to ensure permission %s exists: %w", pName, err)
 			}
 			permissions = append(permissions, perm)
 		}
 
-		// Replace the association to ensure only the specified permissions are available
-		if err := db.Model(&role).Association("Permissions").Replace(permissions); err != nil {
+		// Use the transaction to replace the association
+		if err := tx.Model(&role).Association("Permissions").Replace(permissions); err != nil {
 			return role, fmt.Errorf("failed to associate permissions with role %s: %w", roleName, err)
 		}
 	}
-	// Reload the role to include the permissions
-	db.Preload("Permissions").First(&role, role.ID)
+	// Reload the role within the same transaction to include the permissions
+	tx.Preload("Permissions").First(&role, role.ID)
 	return role, nil
 }
 
-// Helper: Generate Token for User
+// Helper: Generate Token for User (No DB interaction, so no tx needed)
 func generateTokenForUser(user models.User) (string, error) {
-	// Note: GenerateToken requires user.ID, make sure the passed user object has an ID
 	if user.ID == 0 {
 		return "", fmt.Errorf("user must have a valid ID to generate token")
 	}
-	return auth.GenerateToken(&user)
+	// Ensure the user object passed has necessary fields (ID, Username)
+	tokenUser := models.User{Model: gorm.Model{ID: user.ID}, Username: user.Username}
+	return auth.GenerateToken(&tokenUser)
 }
 
-// --- Ensure basic roles and permissions exist in TestMain or setupTestDB ---
-// If SeedInitialData has already created the 'user', 'admin' roles and related permissions,
-// and the test relies on these default settings, then explicit creation may not be necessary here.
-// But for test independence and clarity, it is usually better to explicitly create the roles and permissions required by the test.
+// setupRolesAndPermissions now accepts a *gorm.DB
 func setupRolesAndPermissions(db *gorm.DB) {
-	// Ensure basic permissions exist (if AutoMigrate does not process seed data)
 	permissions := []string{
-		"users:read:self", "users:update:self", "users:delete:self", // User permissions
-		"users:read:all", "users:update:all", "users:delete:all", "users:list", // Admin/Manager permissions
+		"users:read:self", "users:update:self", "users:delete:self",
+		"users:read:all", "users:update:all", "users:delete:all", "users:list",
 		"roles:manage",
+		// Add any other permissions required by tests
+		"users:create", // Assuming CreateUser might need this later
 	}
 	for _, pName := range permissions {
 		perm := models.Permission{Name: pName}
-		// FirstOrCreate avoid duplicate creation
 		if err := db.Where(models.Permission{Name: pName}).FirstOrCreate(&perm).Error; err != nil {
 			panic(fmt.Sprintf("Failed to ensure permission %s: %v", pName, err))
 		}
 	}
 
-	// Create the roles required for testing and associate permissions
-	_, err := createTestRoleWithPermissions(db, "test_user_role", "Basic user role for testing", "users:read:self", "users:update:self")
+	// Use the transaction-aware helper
+	_, err := createTestRoleWithPermissions(db, "test_user_role", "Basic user role for testing", "users:read:self", "users:update:self", "users:delete:self")
 	if err != nil {
 		panic(fmt.Sprintf("Failed to setup test_user_role: %v", err))
 	}
-	_, err = createTestRoleWithPermissions(db, "test_admin_role", "Admin role for testing", "users:read:all", "users:update:all", "users:list")
+	_, err = createTestRoleWithPermissions(db, "test_admin_role", "Admin role for testing", "users:read:all", "users:update:all", "users:delete:all", "users:list", "roles:manage")
 	if err != nil {
 		panic(fmt.Sprintf("Failed to setup test_admin_role: %v", err))
 	}
@@ -135,15 +138,18 @@ func setupRolesAndPermissions(db *gorm.DB) {
 	if err != nil {
 		panic(fmt.Sprintf("Failed to setup test_viewer_role: %v", err))
 	}
-	_, err = createTestRoleWithPermissions(db, "test_no_perms_role", "Role with no user permissions", "roles:manage") // Example role with unrelated perms
+	_, err = createTestRoleWithPermissions(db, "test_no_perms_role", "Role with no user permissions") // Example role with no user perms, maybe other perms
 	if err != nil {
 		panic(fmt.Sprintf("Failed to setup test_no_perms_role: %v", err))
 	}
 }
 
-// --- Modify setupTestDB to call role permission settings ---
-func setupTestDB() *gorm.DB {
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+// setupBaseTestDB initializes the base in-memory SQLite database ONCE
+func setupBaseTestDB() *gorm.DB {
+	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
+		// Reduce log noise during tests
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
 	if err != nil {
 		panic("Failed to connect to test database: " + err.Error())
 	}
@@ -151,54 +157,57 @@ func setupTestDB() *gorm.DB {
 	if err != nil {
 		panic("Failed to migrate test database: " + err.Error())
 	}
-	// Set up roles and permissions required for testing after migration
+	// Set up roles and permissions on the base DB
 	setupRolesAndPermissions(db)
 	return db
 }
 
-// setupRouter sets up a Gin engine and necessary routes for testing
-func setupRouter(userService services.UserService) *gin.Engine {
+// setupRouter now takes a *gorm.DB (the transaction) and returns a Gin engine
+func setupRouter(db *gorm.DB) *gin.Engine {
 	gin.SetMode(gin.TestMode)
-	r := gin.New()
+	r := gin.New() // Use gin.New() for cleaner setup
 
-	// Create a UserController instance, passing in the UserService
+	// Create repository and service bound to the provided DB (transaction)
+	userRepository := repositories.NewUserRepository(db)
+	userService := services.NewUserService(userRepository)
 	userController := NewUserController(userService)
 
-	//Register /register route
+	// --- Public Routes ---
+	// Register /register route (usually public)
 	r.POST("/register", userController.CreateUser)
+	// Login route (usually public)
+	// Note: LoginHandler uses global database.DB, ensure it's set to tx during tests
+	r.POST("/login", auth.LoginHandler)
 
-	// Register user controller related routes
-	// r.POST("/users", CreateUser)
-	// Add routes to be tested
-	// Note: Routes that require authentication are usually placed in a Group and AuthMiddleware is applied
-	// For simplicity, register directly here, but you still need to manually simulate the authentication process (add Token) when testing
+	// --- Protected Routes ---
 	userRoutes := r.Group("/users")
-	userRoutes.Use(auth.AuthMiddleware()) // Apply authentication middleware to routes under /users
+	// Apply authentication middleware. It will use the *global* database.DB
+	// which MUST be set to the transaction 'tx' before calling ServeHTTP.
+	userRoutes.Use(auth.AuthMiddleware())
 	{
 		userRoutes.GET("/:id", userController.GetUserByID)
 		userRoutes.PUT("/:id", userController.UpdateUser)
-		userRoutes.GET("", userController.ListUsers) // GET /users
-		// If there is DeleteUser, also add userRoutes.DELETE("/:id", DeleteUser) here
+		userRoutes.GET("", userController.ListUsers)
+		userRoutes.DELETE("/:id", userController.DeleteUser) // Assuming DeleteUser exists
 	}
 
 	return r
 }
 
-// TestMain will be executed before all tests in the package are run
+// TestMain sets up the base DB for all tests in the package
 func TestMain(m *testing.M) {
-	// Setting up a global test router
-	fmt.Println("Setting up test router...") // Add log to confirm execution
-	db := setupTestDB()
-	userService := services.NewUserService(db)
-	testRouter := setupRouter(userService)
+	fmt.Println("Setting up base test database...")
+	baseDB = setupBaseTestDB() // Initialize the base in-memory DB
 
-	// Print the routes
-	for _, route := range testRouter.Routes() {
-		fmt.Printf("Path: %s, Method: %s, Handler: %s\n", route.Path, route.Method, route.Handler)
-	}
-
-	// Run all tests in a package
+	// Run all tests
 	exitCode := m.Run()
+
+	// Close the base database connection after all tests run
+	sqlDB, err := baseDB.DB()
+	if err == nil {
+		sqlDB.Close()
+		fmt.Println("Closed base test database connection.")
+	}
 
 	// Exit
 	os.Exit(exitCode)
@@ -206,30 +215,23 @@ func TestMain(m *testing.M) {
 
 // TestCreateUser tests the user creation function
 func TestCreateUser(t *testing.T) {
-	// Each test function gets its own routing instance
-	db := setupTestDB()
-	userService := services.NewUserService(db)
-	r := setupRouter(userService)
-	assert.NotNil(t, r, "Test router should not be nil") // Make sure testRouter is initialized
+	// This test focuses on the /register endpoint which is public,
+	// but still good practice to use transactions for isolation.
 
 	// --- Test Case 1: Successfully created user ---
 	t.Run("Success", func(t *testing.T) {
-		// Get a new database connection for each test case
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close() // Close the database connection after the test is completed
-
-		// Use transactions to isolate database operations
-		tx := db.Begin()
-		// **Key**: Save the original global DB and point the global DB to the current transaction
+		tx := baseDB.Begin() // Start transaction from base DB
 		originalDB := database.DB
-		database.DB = tx
-		// **Key**: After testing, be sure to rollback the transaction and restore the original global DB
+		database.DB = tx // Set global DB for any potential implicit use (though CreateUser shouldn't need auth)
 		defer func() {
 			tx.Rollback()
-			database.DB = originalDB
+			database.DB = originalDB // Restore global DB
 		}()
 
-		// Prepare the request body
+		// Setup router bound to the transaction
+		router := setupRouter(tx)
+		assert.NotNil(t, router, "Test router should not be nil")
+
 		userInput := gin.H{
 			"username": "testuser_success",
 			"password": "password123",
@@ -237,164 +239,143 @@ func TestCreateUser(t *testing.T) {
 			"nickname": "tester",
 		}
 		reqBody, _ := json.Marshal(userInput)
-
-		// Build a HTTP request
 		req, _ := http.NewRequest(http.MethodPost, "/register", bytes.NewBuffer(reqBody))
 		req.Header.Set("Content-Type", "application/json")
-
-		// Execute the request
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
 
-		assert.Equal(t, http.StatusCreated, w.Code) // Assert that the status code is 201
+		router.ServeHTTP(w, req)
 
-		var resp UserResponse // Assume CreateUser returns a UserResponse structure
+		assert.Equal(t, http.StatusCreated, w.Code)
+		var resp UserResponse
 		err := json.Unmarshal(w.Body.Bytes(), &resp)
 		assert.NoError(t, err)
 		assert.Equal(t, "testuser_success", resp.Username)
 		assert.Equal(t, "success@example.com", resp.Email)
 		assert.Equal(t, "tester", resp.Nickname)
-		assert.NotZero(t, resp.ID) // ID should be automatically populated by GORM
+		assert.NotZero(t, resp.ID)
 
-		// Assert database status (check inside a transaction)
 		var createdUser models.User
+		// Check within the transaction
 		result := tx.Where("username = ?", "testuser_success").First(&createdUser)
 		assert.NoError(t, result.Error)
 		assert.Equal(t, "testuser_success", createdUser.Username)
 		assert.Equal(t, "success@example.com", createdUser.Email)
 		assert.Equal(t, "tester", createdUser.Nickname)
-		assert.NotEmpty(t, createdUser.Password) // The password should be hashed, not empty
+		assert.NotEmpty(t, createdUser.Password)
 	})
 
 	// --- Test Case 2: Username already exists ---
 	t.Run("Username already exists", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
-
-		tx := db.Begin()
+		tx := baseDB.Begin()
 		originalDB := database.DB
 		database.DB = tx
 		defer func() {
 			tx.Rollback()
 			database.DB = originalDB
 		}()
+		router := setupRouter(tx)
 
-		// Pre-insert a user inside the transcations
+		// Pre-insert a user *within the transaction*
 		hashedPassword, _ := bcrypt.GenerateFromPassword([]byte("password"), bcrypt.DefaultCost)
 		existingUser := models.User{Username: "existinguser", Password: string(hashedPassword), Email: "existing@example.com"}
-		tx.Create(&existingUser)
+		// Use a repository bound to the transaction
+		txRepo := repositories.NewUserRepository(tx)
+		err := txRepo.Create(&existingUser)
+		assert.NoError(t, err)
 
-		// Prepare the request body (using an existing username)
 		userInput := gin.H{
-			"username": "existinguser",
+			"username": "existinguser", // Use existing username
 			"password": "password123",
 			"email":    "another@example.com",
 		}
 		reqBody, _ := json.Marshal(userInput)
-
-		// Create and execute the request
 		req, _ := http.NewRequest(http.MethodPost, "/register", bytes.NewBuffer(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+
+		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusConflict, w.Code)
-
-		// Assert error response message
 		var resp map[string]string
-		err := json.Unmarshal(w.Body.Bytes(), &resp)
+		err = json.Unmarshal(w.Body.Bytes(), &resp)
 		assert.NoError(t, err)
-		assert.Contains(t, resp["message"], "Username already exists")
+		// Check the specific error message from the service layer
+		assert.Equal(t, "Username already exists", resp["message"])
 	})
 
 	// --- Test Case 3: Email already exists ---
 	t.Run("Email already exists", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
-
-		tx := db.Begin()
+		tx := baseDB.Begin()
 		originalDB := database.DB
 		database.DB = tx
 		defer func() {
 			tx.Rollback()
 			database.DB = originalDB
 		}()
+		router := setupRouter(tx)
 
-		// Pre-insert a user
+		// Pre-insert a user *within the transaction*
 		hashedPassword, _ := bcrypt.GenerateFromPassword([]byte("password"), bcrypt.DefaultCost)
 		existingUser := models.User{Username: "anotheruser", Password: string(hashedPassword), Email: "existingemail@example.com"}
-		tx.Create(&existingUser)
+		txRepo := repositories.NewUserRepository(tx)
+		err := txRepo.Create(&existingUser)
+		assert.NoError(t, err)
 
-		// Prepare the request body (using an existing Email)
 		userInput := gin.H{
 			"username": "newuser",
 			"password": "password123",
-			"email":    "existingemail@example.com",
+			"email":    "existingemail@example.com", // Use existing email
 		}
 		reqBody, _ := json.Marshal(userInput)
-
 		req, _ := http.NewRequest(http.MethodPost, "/register", bytes.NewBuffer(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+
+		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusConflict, w.Code)
 		var resp map[string]string
-		err := json.Unmarshal(w.Body.Bytes(), &resp)
+		err = json.Unmarshal(w.Body.Bytes(), &resp)
 		assert.NoError(t, err)
-		assert.Contains(t, resp["message"], "Email already exists")
+		assert.Equal(t, "Email already exists", resp["message"])
 	})
 
 	// --- Test Case 4: Invalid request body (missing required fields) ---
 	t.Run("Invalid request body - missing password", func(t *testing.T) {
-		// This test case theoretically does not access the database, but for consistency, DB is still set
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
-
-		tx := db.Begin()
+		tx := baseDB.Begin() // Still use transaction for consistency
 		originalDB := database.DB
 		database.DB = tx
 		defer func() {
 			tx.Rollback()
 			database.DB = originalDB
 		}()
+		router := setupRouter(tx)
 
-		// Prepare the request body for a missing password
-		reqBody := []byte(`{"username": "testuser_invalid", "email": "invalid@example.com"}`)
-
+		reqBody := []byte(`{"username": "testuser_invalid", "email": "invalid@example.com"}`) // Missing password
 		req, _ := http.NewRequest(http.MethodPost, "/register", bytes.NewBuffer(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+
+		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusBadRequest, w.Code)
-
-		// Assert error response message (should contain field validation error information)
 		var resp map[string]string
 		err := json.Unmarshal(w.Body.Bytes(), &resp)
 		assert.NoError(t, err)
 		assert.Contains(t, resp["message"], "Invalid request body")
-
-		// Can further assert specific binding errors, but this depends on the specific error format of Gin
-		// assert.Contains(t, resp["message"], "Password")
+		assert.Contains(t, resp["message"], "Password") // Gin binding error usually mentions the field
 	})
 
 	// --- Test Case 5: Invalid Email Format ---
 	t.Run("Invalid email format", func(t *testing.T) {
-		db := setupTestDB()
-		sqlDB, _ := db.DB()
-		defer sqlDB.Close()
-
-		tx := db.Begin()
+		tx := baseDB.Begin()
 		originalDB := database.DB
 		database.DB = tx
 		defer func() {
 			tx.Rollback()
 			database.DB = originalDB
 		}()
+		router := setupRouter(tx)
 
 		userInput := gin.H{
 			"username": "testuser_email",
@@ -402,76 +383,54 @@ func TestCreateUser(t *testing.T) {
 			"email":    "invalid-email-format", // Invalid format
 		}
 		reqBody, _ := json.Marshal(userInput)
-
 		req, _ := http.NewRequest(http.MethodPost, "/register", bytes.NewBuffer(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+
+		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusBadRequest, w.Code)
 		var resp map[string]string
 		err := json.Unmarshal(w.Body.Bytes(), &resp)
 		assert.NoError(t, err)
-		// Gin binding errors usually contain field information
-		assert.Contains(t, resp["message"], "Email")
-		assert.Contains(t, resp["message"], "email") // The email format is incorrect
+		assert.Contains(t, resp["message"], "Invalid request body")
+		assert.Contains(t, resp["message"], "Email") // Gin binding error includes field info
 	})
 }
 
-/*
-UpdateUser, GetUserByID and ListUsers:
-
-1. Authentication and Authorization: These interfaces require user authentication, and most have permission requirements. During testing, it is necessary to:
-
-	Create users, roles, and permissions in the test database.
-	Generate a JWT Token for the user initiating the request.
-	Include Authorization: Bearer <token> in the request header.
-	Test behaviors under different permission combinations (success, access denied).
-
-2. Data Preparation: Based on the test scenarios, prepare the data in the database after the transaction begins and before executing the HTTP requests (for example, the user to be updated or retrieved, the list of users to be listed).
-
-3. Scenario Coverage: Test successful paths, resource not found (404), insufficient permissions (403), unauthenticated (401), invalid input (400), and other situations.
-
-4. Reuse Setup: Continue using setupTestDB and setupRouter, and you may need to add some helper functions to create users with specific roles or generate Tokens to reduce code duplication.
-*/
-
 // TestUpdateUser Test update user information
 func TestUpdateUser(t *testing.T) {
-	db := setupTestDB()
-	userService := services.NewUserService(db)
-	r := setupRouter(userService)
 
 	// --- Test Case: Successfully updated my information (nickname and email) ---
 	t.Run("Success - Update Self Nickname and Email", func(t *testing.T) {
-		tx := db.Begin()
+		tx := baseDB.Begin()
 		originalDB := database.DB
-		database.DB = tx
+		database.DB = tx // Set global DB for AuthMiddleware
 		defer func() {
 			tx.Rollback()
-			database.DB = originalDB
+			database.DB = originalDB // Restore
 		}()
+		router := setupRouter(tx) // Router uses the transaction
 
-		// Prepare users and tokens (requires users:update:self permission)
-		testUser := models.User{Username: "updateuser", Password: "password", Email: "update@example.com"}
-		result := tx.Create(&testUser)
-		assert.NoError(t, result.Error)
+		// Prepare user and token *within the transaction*
+		// User needs 'users:update:self' permission
+		testUser, err := createTestUserWithRoles(tx, "updateuser", "password", "update@example.com", "test_user_role")
+		assert.NoError(t, err)
 		assert.NotZero(t, testUser.ID)
 		token, err := generateTokenForUser(testUser)
 		assert.NoError(t, err)
 
-		// Prepare the request body
 		updateData := gin.H{
 			"nickname": "Updated Nickname",
 			"email":    "updated.email@example.com",
 		}
 		reqBody, _ := json.Marshal(updateData)
-
-		// Send the request
 		req, _ := http.NewRequest(http.MethodPut, "/users/"+fmt.Sprint(testUser.ID), bytes.NewBuffer(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+token)
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+
+		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
 		var resp UserResponse
@@ -479,10 +438,10 @@ func TestUpdateUser(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, "Updated Nickname", resp.Nickname)
 		assert.Equal(t, "updated.email@example.com", resp.Email)
-		assert.Equal(t, testUser.Username, resp.Username) // Username should not be changed
+		assert.Equal(t, testUser.Username, resp.Username) // Username should not change
 
-		// Asserting database status
 		var updatedUser models.User
+		// Check DB state *within the transaction*
 		tx.First(&updatedUser, testUser.ID)
 		assert.Equal(t, "Updated Nickname", updatedUser.Nickname)
 		assert.Equal(t, "updated.email@example.com", updatedUser.Email)
@@ -490,108 +449,109 @@ func TestUpdateUser(t *testing.T) {
 
 	// --- Test Case: Successfully updated own password ---
 	t.Run("Success - Update Self Password", func(t *testing.T) {
-		tx := db.Begin()
+		tx := baseDB.Begin()
 		originalDB := database.DB
 		database.DB = tx
 		defer func() { tx.Rollback(); database.DB = originalDB }()
+		router := setupRouter(tx)
 
-		testUser, err := createTestUserWithRoles(tx, "updatepass", "oldpassword", "pass@example.com", "test_user_role")
+		testUser, err := createTestUserWithRoles(tx, "updatepass", "oldpassword", "pass@example.com", "test_user_role") // needs update:self
 		assert.NoError(t, err)
 		token, err := generateTokenForUser(testUser)
 		assert.NoError(t, err)
 
 		updateData := gin.H{"password": "newStrongPassword"}
 		reqBody, _ := json.Marshal(updateData)
-
 		req, _ := http.NewRequest(http.MethodPut, "/users/"+fmt.Sprint(testUser.ID), bytes.NewBuffer(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+token)
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+
+		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
 
-		// Verify that the password in the database has been updated (compare hashes)
 		var updatedUser models.User
 		tx.First(&updatedUser, testUser.ID)
-		// Verify that the new password matches the updated hash
 		err = bcrypt.CompareHashAndPassword([]byte(updatedUser.Password), []byte("newStrongPassword"))
 		assert.NoError(t, err, "New password should match the updated hash")
-		// Verify that the old password no longer matches
 		err = bcrypt.CompareHashAndPassword([]byte(updatedUser.Password), []byte("oldpassword"))
 		assert.Error(t, err, "Old password should no longer match")
 	})
 
 	// --- Test Case: Administrator successfully updates other user information ---
 	t.Run("Success - Admin Update Other User", func(t *testing.T) {
-		tx := db.Begin()
+		tx := baseDB.Begin()
 		originalDB := database.DB
 		database.DB = tx
 		defer func() { tx.Rollback(); database.DB = originalDB }()
+		router := setupRouter(tx)
 
-		// Create administrator and target user
-		adminUser, err := createTestUserWithRoles(tx, "adminupdater", "password", "admin@update.com", "test_admin_role") // need users:update:all
+		// Admin needs 'users:update:all'
+		adminUser, err := createTestUserWithRoles(tx, "adminupdater", "password", "admin@update.com", "test_admin_role")
 		assert.NoError(t, err)
 		targetUser, err := createTestUserWithRoles(tx, "targetuser", "password", "target@update.com", "test_user_role")
 		assert.NoError(t, err)
-
 		adminToken, err := generateTokenForUser(adminUser)
 		assert.NoError(t, err)
 
 		updateData := gin.H{"nickname": "Updated by Admin"}
 		reqBody, _ := json.Marshal(updateData)
-
 		req, _ := http.NewRequest(http.MethodPut, "/users/"+fmt.Sprint(targetUser.ID), bytes.NewBuffer(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+adminToken)
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+
+		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
-		// ... assert the response body and database ...
 		var updatedUser models.User
 		tx.First(&updatedUser, targetUser.ID)
 		assert.Equal(t, "Updated by Admin", updatedUser.Nickname)
-
 	})
 
 	// --- Test Case: Failure - Tried to update other people's information but didn't have permission ---
 	t.Run("Failure - Update Other No Permission", func(t *testing.T) {
-		tx := db.Begin()
+		tx := baseDB.Begin()
 		originalDB := database.DB
 		database.DB = tx
 		defer func() { tx.Rollback(); database.DB = originalDB }()
+		router := setupRouter(tx)
 
-		// Create normal users A and B
-		userA, err := createTestUserWithRoles(tx, "userA_update", "password", "a@update.com", "test_user_role") // only have update:self
+		// User A only has 'users:update:self'
+		userA, err := createTestUserWithRoles(tx, "userA_update", "password", "a@update.com", "test_user_role")
 		assert.NoError(t, err)
 		userB, err := createTestUserWithRoles(tx, "userB_update", "password", "b@update.com", "test_user_role")
 		assert.NoError(t, err)
-
 		tokenA, err := generateTokenForUser(userA)
 		assert.NoError(t, err)
 
 		updateData := gin.H{"nickname": "Attempted Update"}
 		reqBody, _ := json.Marshal(updateData)
-
-		// User A try to update User B
+		// User A tries to update User B
 		req, _ := http.NewRequest(http.MethodPut, "/users/"+fmt.Sprint(userB.ID), bytes.NewBuffer(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+tokenA)
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
 
-		assert.Equal(t, http.StatusForbidden, w.Code) // Insufficient permissions
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusForbidden, w.Code) // Expect 403 Forbidden
+		var resp map[string]string
+		err = json.Unmarshal(w.Body.Bytes(), &resp)
+		assert.NoError(t, err)
+		assert.Equal(t, "Forbidden: You can only update your own profile or require 'users:update:all' permission", resp["message"])
 	})
 
 	// --- Test Case: Failure - updating a non-existent user ---
 	t.Run("Failure - User Not Found", func(t *testing.T) {
-		tx := db.Begin()
+		tx := baseDB.Begin()
 		originalDB := database.DB
 		database.DB = tx
 		defer func() { tx.Rollback(); database.DB = originalDB }()
+		router := setupRouter(tx)
 
-		// Create an administrator with the authority to update anyone
+		// Admin has permission to update anyone
 		adminUser, err := createTestUserWithRoles(tx, "adminupdater_nf", "password", "admin_nf@update.com", "test_admin_role")
 		assert.NoError(t, err)
 		adminToken, err := generateTokenForUser(adminUser)
@@ -600,87 +560,94 @@ func TestUpdateUser(t *testing.T) {
 		nonExistentUserID := uint(99999)
 		updateData := gin.H{"nickname": "Wont Update"}
 		reqBody, _ := json.Marshal(updateData)
-
 		req, _ := http.NewRequest(http.MethodPut, "/users/"+fmt.Sprint(nonExistentUserID), bytes.NewBuffer(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+adminToken)
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
 
-		assert.Equal(t, http.StatusNotFound, w.Code)
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusNotFound, w.Code) // Expect 404 Not Found
+		var resp map[string]string
+		err = json.Unmarshal(w.Body.Bytes(), &resp)
+		assert.NoError(t, err)
+		assert.Equal(t, "User not found", resp["message"])
 	})
 
 	//--- Test Case: Failure - Email Conflict ---
 	t.Run("Failure - Email Conflict", func(t *testing.T) {
-		tx := db.Begin()
+		tx := baseDB.Begin()
 		originalDB := database.DB
 		database.DB = tx
 		defer func() { tx.Rollback(); database.DB = originalDB }()
+		router := setupRouter(tx)
 
-		user1, err := createTestUserWithRoles(tx, "emailuser1", "password", "email1@conflict.com", "test_user_role")
+		user1, err := createTestUserWithRoles(tx, "emailuser1", "password", "email1@conflict.com", "test_user_role") // Needs update:self
 		assert.NoError(t, err)
-		user2, err := createTestUserWithRoles(tx, "emailuser2", "password", "email2@conflict.com", "test_user_role") // User 2 的 email
+		user2, err := createTestUserWithRoles(tx, "emailuser2", "password", "email2@conflict.com", "test_user_role")
 		assert.NoError(t, err)
-
 		token1, err := generateTokenForUser(user1)
 		assert.NoError(t, err)
 
-		// User 1 tries to update his email to the email already used by User 2
+		// User 1 tries to update their email to user2's email
 		updateData := gin.H{"email": user2.Email}
 		reqBody, _ := json.Marshal(updateData)
-
 		req, _ := http.NewRequest(http.MethodPut, "/users/"+fmt.Sprint(user1.ID), bytes.NewBuffer(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+token1)
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
 
-		assert.Equal(t, http.StatusConflict, w.Code)
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusConflict, w.Code) // Expect 409 Conflict
 		var resp map[string]string
-		json.Unmarshal(w.Body.Bytes(), &resp)
-		assert.Contains(t, resp["message"], "Email address is already in use")
+		err = json.Unmarshal(w.Body.Bytes(), &resp)
+		assert.NoError(t, err)
+		// Check specific error message from service
+		assert.Equal(t, "Email address is already in use by another account", resp["message"])
 	})
 
 	// --- Test Case: Failed - Token not provided ---
 	t.Run("Failure - No Auth Token", func(t *testing.T) {
-		tx := db.Begin()
+		tx := baseDB.Begin() // Need transaction to potentially create user
 		originalDB := database.DB
 		database.DB = tx
 		defer func() { tx.Rollback(); database.DB = originalDB }()
+		router := setupRouter(tx)
 
+		// Create a user, ID doesn't matter much here as auth fails first
 		user, err := createTestUserWithRoles(tx, "noauthupdate", "password", "noauth@update.com", "test_user_role")
 		assert.NoError(t, err)
 
 		updateData := gin.H{"nickname": "No Auth Update"}
 		reqBody, _ := json.Marshal(updateData)
-
 		req, _ := http.NewRequest(http.MethodPut, "/users/"+fmt.Sprint(user.ID), bytes.NewBuffer(reqBody))
 		req.Header.Set("Content-Type", "application/json")
-		// No Authorization header
+		// No Authorization header!
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
 
-		// AuthMiddleware should be banned
-		assert.Equal(t, http.StatusUnauthorized, w.Code)
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusUnauthorized, w.Code) // Expect 401 Unauthorized
 	})
 
 	// TODO: Add more test cases (invalid input: wrong email format, password too short, etc.)
+	// e.g., t.Run("Failure - Invalid Email Format", func(t *testing.T) { ... })
+	// e.g., t.Run("Failure - Password Too Short", func(t *testing.T) { ... })
 }
 
 // TestGetUserByID Test to obtain single user information
 func TestGetUserByID(t *testing.T) {
-	db := setupTestDB()
-	userService := services.NewUserService(db)
-	r := setupRouter(userService)
 
 	// --- Test Case: Successfully obtain your own information ---
 	t.Run("Success - Read Self", func(t *testing.T) {
-		tx := db.Begin()
+		tx := baseDB.Begin()
 		originalDB := database.DB
 		database.DB = tx
 		defer func() { tx.Rollback(); database.DB = originalDB }()
+		router := setupRouter(tx)
 
-		// The user needs users:read:self permission
+		// User needs 'users:read:self' permission
 		testUser, err := createTestUserWithRoles(tx, "readselfuser", "password", "self@read.com", "test_user_role")
 		assert.NoError(t, err)
 		token, err := generateTokenForUser(testUser)
@@ -689,7 +656,8 @@ func TestGetUserByID(t *testing.T) {
 		req, _ := http.NewRequest(http.MethodGet, "/users/"+fmt.Sprint(testUser.ID), nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+
+		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
 		var resp UserResponse
@@ -702,24 +670,25 @@ func TestGetUserByID(t *testing.T) {
 
 	// --- Test Case: Successfully obtain other people's information (requires users:read:all) ---
 	t.Run("Success - Read Other With Permission", func(t *testing.T) {
-		tx := db.Begin()
+		tx := baseDB.Begin()
 		originalDB := database.DB
 		database.DB = tx
 		defer func() { tx.Rollback(); database.DB = originalDB }()
+		router := setupRouter(tx)
 
-		// Create administrator and target user
-		adminUser, err := createTestUserWithRoles(tx, "adminreader", "password", "admin@read.com", "test_admin_role") // 有 read:all
+		// Admin needs 'users:read:all'
+		adminUser, err := createTestUserWithRoles(tx, "adminreader", "password", "admin@read.com", "test_admin_role")
 		assert.NoError(t, err)
 		targetUser, err := createTestUserWithRoles(tx, "targetreader", "password", "target@read.com", "test_user_role")
 		assert.NoError(t, err)
-
 		adminToken, err := generateTokenForUser(adminUser)
 		assert.NoError(t, err)
 
 		req, _ := http.NewRequest(http.MethodGet, "/users/"+fmt.Sprint(targetUser.ID), nil)
 		req.Header.Set("Authorization", "Bearer "+adminToken)
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+
+		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
 		var resp UserResponse
@@ -727,41 +696,50 @@ func TestGetUserByID(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, targetUser.ID, resp.ID)
 		assert.Equal(t, targetUser.Username, resp.Username)
-
 	})
 
 	// --- Test Case: Failed - Tried to get other people's information but didn't have permission ---
 	t.Run("Failure - Read Other No Permission", func(t *testing.T) {
-		tx := db.Begin()
+		tx := baseDB.Begin()
 		originalDB := database.DB
 		database.DB = tx
 		defer func() { tx.Rollback(); database.DB = originalDB }()
+		router := setupRouter(tx)
 
-		userA, err := createTestUserWithRoles(tx, "userA_read", "password", "a@read.com", "test_user_role") // 只有 read:self
+		// User A only has 'users:read:self'
+		userA, err := createTestUserWithRoles(tx, "userA_read", "password", "a@read.com", "test_user_role")
 		assert.NoError(t, err)
 		userB, err := createTestUserWithRoles(tx, "userB_read", "password", "b@read.com", "test_user_role")
 		assert.NoError(t, err)
-
 		tokenA, err := generateTokenForUser(userA)
 		assert.NoError(t, err)
 
-		// User A try to access User B
+		// User A tries to access User B
 		req, _ := http.NewRequest(http.MethodGet, "/users/"+fmt.Sprint(userB.ID), nil)
 		req.Header.Set("Authorization", "Bearer "+tokenA)
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
 
-		assert.Equal(t, http.StatusForbidden, w.Code)
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusForbidden, w.Code) // Expect 403
+		var resp map[string]string
+		err = json.Unmarshal(w.Body.Bytes(), &resp)
+		assert.NoError(t, err)
+		// Check specific error message from service/controller
+		assert.Equal(t, "Forbidden: You need 'users:read:all' permission to view other profiles", resp["message"])
 	})
 
 	// --- Test Case: Failed - Tried to get self information but did not have read:self permission ---
+	// Note: The current service logic allows reading self IF isSelf AND canReadSelf.
+	// If a user truly has NO read permissions at all, this test makes sense.
 	t.Run("Failure - Read Self No Permission", func(t *testing.T) {
-		tx := db.Begin()
+		tx := baseDB.Begin()
 		originalDB := database.DB
 		database.DB = tx
 		defer func() { tx.Rollback(); database.DB = originalDB }()
+		router := setupRouter(tx)
 
-		// Create a user without the read:self permission
+		// Create user with a role that lacks 'users:read:self'
 		noPermUser, err := createTestUserWithRoles(tx, "noperm_read", "password", "noperm@read.com", "test_no_perms_role")
 		assert.NoError(t, err)
 		token, err := generateTokenForUser(noPermUser)
@@ -770,19 +748,26 @@ func TestGetUserByID(t *testing.T) {
 		req, _ := http.NewRequest(http.MethodGet, "/users/"+fmt.Sprint(noPermUser.ID), nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
 
-		assert.Equal(t, http.StatusForbidden, w.Code) // Should be banned
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusForbidden, w.Code) // Expect 403
+		var resp map[string]string
+		err = json.Unmarshal(w.Body.Bytes(), &resp)
+		assert.NoError(t, err)
+		assert.Equal(t, "Forbidden: You need 'users:read:all' permission to view other profiles", resp["message"]) // Check the message
 	})
 
 	// --- Test Case: Failure - Get a non-existent user ---
 	t.Run("Failure - User Not Found", func(t *testing.T) {
-		tx := db.Begin()
+		tx := baseDB.Begin()
 		originalDB := database.DB
 		database.DB = tx
 		defer func() { tx.Rollback(); database.DB = originalDB }()
+		router := setupRouter(tx)
 
-		adminUser, err := createTestUserWithRoles(tx, "adminreader_nf", "password", "admin_nf@read.com", "test_admin_role") // 需要有权限才能尝试读取
+		// Admin user has permission to read anyone ('users:read:all')
+		adminUser, err := createTestUserWithRoles(tx, "adminreader_nf", "password", "admin_nf@read.com", "test_admin_role")
 		assert.NoError(t, err)
 		adminToken, err := generateTokenForUser(adminUser)
 		assert.NoError(t, err)
@@ -791,112 +776,66 @@ func TestGetUserByID(t *testing.T) {
 		req, _ := http.NewRequest(http.MethodGet, "/users/"+fmt.Sprint(nonExistentUserID), nil)
 		req.Header.Set("Authorization", "Bearer "+adminToken)
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
 
-		assert.Equal(t, http.StatusNotFound, w.Code)
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusNotFound, w.Code) // Expect 404
+		var resp map[string]string
+		err = json.Unmarshal(w.Body.Bytes(), &resp)
+		assert.NoError(t, err)
+		assert.Equal(t, "User not found", resp["message"])
 	})
 
 	// --- Test Case: Failed - Token not provided ---
 	t.Run("Failure - No Auth Token", func(t *testing.T) {
-		req, _ := http.NewRequest(http.MethodGet, "/users/1", nil) // It doesn't matter whether ID 1 exists
+		tx := baseDB.Begin() // No DB interaction needed before auth, but setup requires it
+		originalDB := database.DB
+		database.DB = tx
+		defer func() { tx.Rollback(); database.DB = originalDB }()
+		router := setupRouter(tx)
+
+		req, _ := http.NewRequest(http.MethodGet, "/users/1", nil) // ID 1 might not exist, doesn't matter
 		// No Authorization header
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-		assert.Equal(t, http.StatusUnauthorized, w.Code)
+
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusUnauthorized, w.Code) // Expect 401
 	})
 }
 
 // TestListUsers Test to get the user list (pagination)
 func TestListUsers(t *testing.T) {
-	db := setupTestDB()
-	userService := services.NewUserService(db)
-	r := setupRouter(userService)
-	defer func() {
-		sqlDB, _ := db.DB()
-		sqlDB.Close()
-	}()
 
 	// --- Test Case: Successfully obtain the user list (requires users:list permission) ---
 	t.Run("Success - List Users With Permission", func(t *testing.T) {
-		tx := db.Begin()
+		tx := baseDB.Begin()
 		originalDB := database.DB
 		database.DB = tx
-		defer func() {
-			tx.Rollback()
-			database.DB = originalDB
-		}()
+		defer func() { tx.Rollback(); database.DB = originalDB }()
+		router := setupRouter(tx)
 
-		// Create a user with list permission
-		listUser, err := createTestUserWithRoles(tx, "listuser", "password", "list@example.com", "test_admin_role") // admin role has 'users:list'
+		// User needs 'users:list' permission (admin role has it)
+		listUser, err := createTestUserWithRoles(tx, "listuser", "password", "list@example.com", "test_admin_role")
 		assert.NoError(t, err)
 		token, err := generateTokenForUser(listUser)
 		assert.NoError(t, err)
 
-		// Create some other users for list display
+		// Create other users to populate the list
 		_, err = createTestUserWithRoles(tx, "user1_list", "password", "u1@list.com", "test_user_role")
 		assert.NoError(t, err)
 		_, err = createTestUserWithRoles(tx, "user2_list", "password", "u2@list.com", "test_user_role")
 		assert.NoError(t, err)
-		// ... May need to create more users to test paging ...
+
+		// Get total count *within the transaction*
 		var totalUsers int64
-		tx.Model(&models.User{}).Count(&totalUsers) // Get the total number of users
+		tx.Model(&models.User{}).Count(&totalUsers)
 
 		req, _ := http.NewRequest(http.MethodGet, "/users?page=1&page_size=10", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
 
-		assert.Equal(t, http.StatusOK, w.Code)
-		var resp PaginatedUsersResponse
-		err = json.Unmarshal(w.Body.Bytes(), &resp)
-		assert.NoError(t, err)
-
-		assert.Equal(t, totalUsers, resp.Total) // Verify the total number of users
-		assert.Equal(t, 1, resp.Page)
-		assert.Equal(t, 10, resp.PageSize)
-		// Verify the number of users returned (depends on pageSize and totalUsers)
-		expectedCount := int(totalUsers)
-		if expectedCount > 10 {
-			expectedCount = 10
-		}
-		assert.Len(t, resp.Users, expectedCount)
-		// Can further check whether the returned user information is correct, such as user name, etc.
-		foundListUser := false
-		for _, u := range resp.Users {
-			if u.Username == "listuser" {
-				foundListUser = true
-				break
-			}
-		}
-		assert.True(t, foundListUser, "Requesting user should be in the list")
-
-	})
-
-	// --- Test Case: Successfully obtain the user list - test paging ---
-	t.Run("Success - List Users Pagination", func(t *testing.T) {
-		tx := db.Begin()
-		originalDB := database.DB
-		database.DB = tx
-		defer func() { tx.Rollback(); database.DB = originalDB }()
-
-		listUser, err := createTestUserWithRoles(tx, "pageruser", "password", "pager@example.com", "test_admin_role")
-		assert.NoError(t, err)
-		token, err := generateTokenForUser(listUser)
-		assert.NoError(t, err)
-
-		// Create more than one page of users (for example, create 12, plus listUser 13 in total)
-		for i := 0; i < 12; i++ {
-			_, err = createTestUserWithRoles(tx, fmt.Sprintf("page_user_%d", i), "password", fmt.Sprintf("page%d@list.com", i), "test_user_role")
-			assert.NoError(t, err)
-		}
-		var totalUsers int64
-		tx.Model(&models.User{}).Count(&totalUsers) // Should be 13
-
-		// Request the second page, 5 items per page
-		req, _ := http.NewRequest(http.MethodGet, "/users?page=2&page_size=5", nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
 		var resp PaginatedUsersResponse
@@ -904,51 +843,123 @@ func TestListUsers(t *testing.T) {
 		assert.NoError(t, err)
 
 		assert.Equal(t, totalUsers, resp.Total)
+		assert.Equal(t, 1, resp.Page)
+		assert.Equal(t, 10, resp.PageSize)
+		assert.Len(t, resp.Users, int(totalUsers)) // Assuming totalUsers <= 10 here
+
+		foundListUser := false
+		for _, u := range resp.Users {
+			assert.NotEmpty(t, u.Username) // Basic check on returned data
+			if u.Username == "listuser" {
+				foundListUser = true
+			}
+		}
+		assert.True(t, foundListUser, "Requesting user should be in the list")
+	})
+
+	// --- Test Case: Successfully obtain the user list - test paging ---
+	t.Run("Success - List Users Pagination", func(t *testing.T) {
+		tx := baseDB.Begin()
+		originalDB := database.DB
+		database.DB = tx
+		defer func() { tx.Rollback(); database.DB = originalDB }()
+		router := setupRouter(tx)
+
+		// User needs 'users:list'
+		listUser, err := createTestUserWithRoles(tx, "pageruser", "password", "pager@example.com", "test_admin_role")
+		assert.NoError(t, err)
+		token, err := generateTokenForUser(listUser)
+		assert.NoError(t, err)
+
+		// Create 12 more users (total 13 with listUser)
+		for i := 0; i < 12; i++ {
+			_, err = createTestUserWithRoles(tx, fmt.Sprintf("page_user_%d", i), "password", fmt.Sprintf("page%d@list.com", i), "test_user_role")
+			assert.NoError(t, err)
+		}
+		var totalUsers int64
+		tx.Model(&models.User{}).Count(&totalUsers)
+		assert.EqualValues(t, 13, totalUsers) // Verify total count
+
+		// Request page 2, size 5
+		req, _ := http.NewRequest(http.MethodGet, "/users?page=2&page_size=5", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var resp PaginatedUsersResponse
+		err = json.Unmarshal(w.Body.Bytes(), &resp)
+		assert.NoError(t, err)
+		assert.Equal(t, totalUsers, resp.Total)
 		assert.Equal(t, 2, resp.Page)
 		assert.Equal(t, 5, resp.PageSize)
 		assert.Len(t, resp.Users, 5) // Page 2 should have 5
 
-		// Request last page
+		// Request page 3, size 5
 		req, _ = http.NewRequest(http.MethodGet, "/users?page=3&page_size=5", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 		w = httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+		router.ServeHTTP(w, req)
+
 		assert.Equal(t, http.StatusOK, w.Code)
 		err = json.Unmarshal(w.Body.Bytes(), &resp)
 		assert.NoError(t, err)
 		assert.Equal(t, totalUsers, resp.Total)
 		assert.Equal(t, 3, resp.Page)
 		assert.Equal(t, 5, resp.PageSize)
-		assert.Len(t, resp.Users, 3) // The last page has only 3 (13 total, 5 per page)
+		assert.Len(t, resp.Users, 3) // Last page has remaining 3 (13 total = 5 + 5 + 3)
 	})
 
 	// --- Test Case: Failure - Tried to get list but no permission ---
 	t.Run("Failure - List Users No Permission", func(t *testing.T) {
-		tx := db.Begin()
+		tx := baseDB.Begin()
 		originalDB := database.DB
 		database.DB = tx
 		defer func() { tx.Rollback(); database.DB = originalDB }()
+		router := setupRouter(tx)
 
-		// Create a user without list permission
-		noListUser, err := createTestUserWithRoles(tx, "nolistuser", "password", "nolist@example.com", "test_user_role") // user_role 没有 users:list
+		// User role lacks 'users:list' permission
+		noListUser, err := createTestUserWithRoles(tx, "nolistuser", "password", "nolist@example.com", "test_user_role")
 		assert.NoError(t, err)
 		token, err := generateTokenForUser(noListUser)
 		assert.NoError(t, err)
 
-		req, _ := http.NewRequest(http.MethodGet, "/users", nil)
+		req, _ := http.NewRequest(http.MethodGet, "/users", nil) // Default page=1, size=10
 		req.Header.Set("Authorization", "Bearer "+token)
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
 
-		assert.Equal(t, http.StatusForbidden, w.Code)
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusForbidden, w.Code) // Expect 403
+		var resp map[string]string
+		err = json.Unmarshal(w.Body.Bytes(), &resp)
+		assert.NoError(t, err)
+		assert.Equal(t, "Forbidden: You need 'users:list' permission", resp["message"])
 	})
 
 	// --- Test Case: Failed - Token not provided ---
 	t.Run("Failure - No Auth Token", func(t *testing.T) {
+		tx := baseDB.Begin()
+		originalDB := database.DB
+		database.DB = tx
+		defer func() { tx.Rollback(); database.DB = originalDB }()
+		router := setupRouter(tx)
+
 		req, _ := http.NewRequest(http.MethodGet, "/users", nil)
 		// No Authorization header
 		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-		assert.Equal(t, http.StatusUnauthorized, w.Code)
+
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusUnauthorized, w.Code) // Expect 401
 	})
 }
+
+// TODO: Add TestDeleteUser following the same transaction and permission patterns
+// func TestDeleteUser(t *testing.T) {
+//     t.Run("Success - Delete Self", func(t *testing.T) { ... })
+//     t.Run("Success - Admin Delete Other", func(t *testing.T) { ... })
+//     t.Run("Failure - Delete Other No Permission", func(t *testing.T) { ... })
+//     t.Run("Failure - Delete Non-Existent User", func(t *testing.T) { ... })
+//     t.Run("Failure - No Auth Token", func(t *testing.T) { ... })
+// }

@@ -4,8 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"mygin/auth"
-	"mygin/database"
 	"mygin/models"
+	"mygin/repositories"
 	"net/http"
 	"time"
 
@@ -40,7 +40,8 @@ type UpdateUserInput struct {
 
 // The userService structure is the implementation of the UserService interface
 type userService struct {
-	db *gorm.DB
+	// db *gorm.DB
+	repo repositories.UserRepository
 }
 
 type UserResponse struct {
@@ -62,24 +63,28 @@ type PaginatedUsersResponse struct {
 var _ UserService = (*userService)(nil)
 
 // NewUserService creates a new UserService instance
-func NewUserService(db *gorm.DB) UserService {
-	return &userService{db: db}
+func NewUserService(repo repositories.UserRepository) UserService {
+	return &userService{repo: repo}
 }
 
 // CreateUser handles the creation of a new user.
 // Permissions: None (public registration assumed) or specific ("users:create")
 func (s *userService) CreateUser(input *CreateUserInput) (*models.User, error) {
-
 	// Check if username or email already exists
-	var existingUser models.User
-	if err := database.DB.Where("username = ? OR email = ?", input.Username, input.Email).First(&existingUser).Error; err == nil {
-		message := "Username already exists"
-		if existingUser.Email == input.Email && input.Email != "" { // Check if email conflict specifically
-			message = "Email already exists"
-		}
-		return nil, errors.New(message)
+	_, err := s.repo.FindByUsername(input.Username)
+	if err == nil {
+		return nil, errors.New("Username already exists")
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, errors.New("Database error checking existing user")
+	}
+
+	if input.Email != "" {
+		_, err = s.repo.FindByEmail(input.Email)
+		if err == nil {
+			return nil, errors.New("Email already exists")
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errors.New("Database error checking existing user")
+		}
 	}
 
 	// Hash password
@@ -95,19 +100,10 @@ func (s *userService) CreateUser(input *CreateUserInput) (*models.User, error) {
 		Nickname: input.Nickname,
 	}
 
-	// Assign default role (e.g., "user")
-	var defaultRole models.Role
-	if err := database.DB.Where("name = ?", "user").First(&defaultRole).Error; err == nil {
-		user.Roles = append(user.Roles, defaultRole)
-	} else {
-		fmt.Println("Warning: Default 'user' role not found, user created without roles.")
-		// Decide if this should be a hard error
-	}
-
 	// Create user
-	result := database.DB.Create(&user)
-	if result.Error != nil {
-		return nil, errors.New("Failed to create user: " + result.Error.Error())
+	err = s.repo.Create(&user)
+	if err != nil {
+		return nil, errors.New("Failed to create user: " + err.Error())
 	}
 
 	return &user, nil // Return the created user details (excluding password)
@@ -116,7 +112,6 @@ func (s *userService) CreateUser(input *CreateUserInput) (*models.User, error) {
 // GetUserByID retrieves a single user by their ID.
 // Permissions: "users:read:self" or "users:read:all"
 func (s *userService) GetUserByID(targetUserID uint, requestingUserID uint) (*models.User, error) {
-
 	// --- Permission check ---
 	canReadAny, _ := auth.UserHasPermissions(requestingUserID, "users:read:all")
 	canReadSelf, _ := auth.UserHasPermissions(requestingUserID, "users:read:self")
@@ -135,12 +130,9 @@ func (s *userService) GetUserByID(targetUserID uint, requestingUserID uint) (*mo
 	}
 	// --- End of permission check ---
 
-	var user models.User
-	// Usually you don't need to preload Role and Permission unless your UserResponse needs to display this information
-	result := database.DB.First(&user, targetUserID)
-
-	if result.Error != nil {
-		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+	user, err := s.repo.FindByID(targetUserID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, errors.New("User not found")
 		} else {
 			return nil, errors.New("Database error retrieving user")
@@ -148,17 +140,15 @@ func (s *userService) GetUserByID(targetUserID uint, requestingUserID uint) (*mo
 
 	}
 
-	// Use mapUserToResponse to avoid exposing sensitive information such as passwords
-	return &user, nil
+	return user, nil
 }
 
 // UpdateUser updates a user's details.
 // Permissions: "users:update:self" or "users:update:all"
 func (s *userService) UpdateUser(targetUserID uint, requestingUserID uint, input *UpdateUserInput) (*models.User, error) {
-
 	// Permission Check
 	canUpdateAny, _ := auth.UserHasPermissions(requestingUserID, "users:update:all")
-	canUpdateSelf, _ := auth.UserHasPermissions(requestingUserID, "users:update:self")
+	// canUpdateSelf, _ := auth.UserHasPermissions(requestingUserID, "users:update:self")
 
 	isSelf := uint(targetUserID) == requestingUserID
 
@@ -166,16 +156,11 @@ func (s *userService) UpdateUser(targetUserID uint, requestingUserID uint, input
 		return nil, errors.New("Forbidden: You can only update your own profile or require 'users:update:all' permission")
 
 	}
-	if !isSelf && !canUpdateSelf && !canUpdateAny {
-		return nil, errors.New("Forbidden: Insufficient permissions to update this profile")
-
-	}
 
 	// Fetch the user to update
-	var user models.User
-	result := database.DB.First(&user, targetUserID)
-	if result.Error != nil {
-		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+	user, err := s.repo.FindByID(targetUserID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, errors.New("User not found")
 		} else {
 			return nil, errors.New("Database error retrieving user for update")
@@ -189,9 +174,8 @@ func (s *userService) UpdateUser(targetUserID uint, requestingUserID uint, input
 	// Update Email
 	if input.Email != nil {
 		// Check if the new email is already taken by *another* user
-		var existingUser models.User
-		err := database.DB.Where("email = ? AND id != ?", *&input.Email, user.ID).First(&existingUser).Error
-		if err == nil {
+		existingUser, err := s.repo.FindByEmail(*input.Email)
+		if err == nil && existingUser.ID != user.ID {
 			// Found another user with this email
 			return nil, errors.New("Email address is already in use by another account")
 
@@ -227,28 +211,29 @@ func (s *userService) UpdateUser(targetUserID uint, requestingUserID uint, input
 
 	// Save changes if any fields were updated
 	if needsSave {
-		if err := database.DB.Save(&user).Error; err != nil {
+		if err := s.repo.Update(user); err != nil {
 			return nil, errors.New("Failed to save user updates: " + err.Error())
 
 		}
 	}
 
 	// Return updated user data (potentially re-fetch to get updated associations like roles if changed)
-	var updatedUser models.User
-	database.DB.First(&updatedUser, user.ID) // Re-fetch fresh data
+	updatedUser, err := s.repo.FindByID(user.ID)
+	if err != nil {
+		return nil, err
+	}
 
-	return &updatedUser, nil
+	return updatedUser, nil
 }
 
 // ListUsers retrieves a paginated list of users.
 // Permissions: "users:list"
 func (s *userService) ListUsers(page int, pageSize int, requestingUserID uint) ([]models.User, int64, error) {
-	requestingUserID = requestingUserID
 	// --- Permission check ---
 	canList, err := auth.UserHasPermissions(requestingUserID, "users:list")
 	if err != nil {
 		// Handling possible errors returned by UserHasPermissions
-		return nil, 0, fmt.Errorf("Error checking permissions:%w",err)
+		return nil, 0, fmt.Errorf("Error checking permissions:%w", err)
 	}
 	if !canList {
 		return nil, 0, errors.New("Forbidden: You need 'users:list' permission")
@@ -256,20 +241,8 @@ func (s *userService) ListUsers(page int, pageSize int, requestingUserID uint) (
 	}
 	// --- End of permission check ---
 
-	// Paging parameter processing
-	offset := (page - 1) * pageSize
-
-	var users []models.User
-	var total int64
-
-	// Total number of queries
-	if err := database.DB.Model(&models.User{}).Count(&total).Error; err != nil {
-		return nil, 0, errors.New("Database error counting users")
-	}
-
-	// Query the user data of the current page
-	result := database.DB.Offset(offset).Limit(pageSize).Find(&users)
-	if result.Error != nil {
+	users, total, err := s.repo.FindAll(page, pageSize)
+	if err != nil {
 		return nil, 0, errors.New("Database error retrieving users")
 	}
 
@@ -288,19 +261,18 @@ func (s *userService) DeleteUser(userID uint, requestingUserID uint) error {
 	}
 
 	// Query user information
-	var user models.User
-	result := s.db.First(&user, userID)
-	if result.Error != nil {
-		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+	user, err := s.repo.FindByID(userID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return errors.New("User not exist")
 		}
-		return fmt.Errorf("Failed to obtain user information: %w", result.Error)
+		return fmt.Errorf("Failed to obtain user information: %w", err)
 	}
 
 	// Deleting User Information
-	result = s.db.Delete(&user)
-	if result.Error != nil {
-		return fmt.Errorf("Failed to delete user information: %w", result.Error)
+	err = s.repo.Delete(user)
+	if err != nil {
+		return fmt.Errorf("Failed to delete user information: %w", err)
 	}
 
 	return nil
