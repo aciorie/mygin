@@ -3,9 +3,9 @@ package services
 import (
 	"errors"
 	"fmt"
-	"mygin/auth"
-	"mygin/models"
-	"mygin/repositories"
+	"mygin-restful/auth"
+	"mygin-restful/models"
+	"mygin-restful/repositories"
 	"net/http"
 	"time"
 
