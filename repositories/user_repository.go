@@ -1,7 +1,7 @@
 package repositories
 
 import (
-	"mygin/models"
+	"mygin-restful/models"
 
 	"gorm.io/gorm"
 )
