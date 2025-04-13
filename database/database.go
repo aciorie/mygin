@@ -3,8 +3,8 @@ package database
 import (
 	"fmt"
 	"log"
-	"mygin-restful/config"
-	"mygin-restful/models"
+	"mygin/config"
+	"mygin/models"
 	"os"
 	"time"
 

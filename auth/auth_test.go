@@ -3,8 +3,8 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
-	"mygin-restful/database"
-	"mygin-restful/models"
+	"mygin/database"
+	"mygin/models"
 	"strings"
 
 	"net/http"
