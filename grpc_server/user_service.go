@@ -2,11 +2,16 @@ package grpcserver
 
 import (
 	"context"
+	"errors"
 	"mygin-restful/models"
 	userpb "mygin-restful/proto/user" // Import generated user proto
 	"mygin-restful/services"
+	"strings"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"gorm.io/gorm"
 )
 
 // userServiceServer implements the proto-defined UserServiceServer interface.
@@ -39,22 +44,32 @@ func modelToProtoUser(u *models.User) *userpb.User {
 
 // GetUser is the gRPC handler for retrieving a user.
 func (s *userServiceServer) GetUser(ctx context.Context, req *userpb.GetUserRequest) (*userpb.User, error) {
-	// Note: Basic implementation. Production might need to extract requesting user ID from context (via gRPC metadata/interceptor)
-	// For now, assuming any gRPC call has permission or using a dummy/system user ID for checks.
-	// Let's assume requestingUserID 0 means internal call or permission checks happen elsewhere for now.
+	// TODO: Extract requesting user ID from context (gRPC metadata/interceptor)
+	// An interceptor should validate the incoming token (from metadata) and
+	// inject the user ID into the context.
+	// For now, using 0 implies internal call or requires separate permission check.
 	requestingUserID := uint(0) // Simplified for example
 
 	user, err := s.userService.GetUserByID(uint(req.UserId), requestingUserID)
 	if err != nil {
-		// Convert service errors to gRPC errors (e.g., NotFound, PermissionDenied)
-		// For simplicity, returning the raw error now. Use status.Errorf later.
-		return nil, err
+		errMsg := err.Error()
+		if errors.Is(err, gorm.ErrRecordNotFound) || strings.Contains(errMsg, "not found") {
+			return nil, status.Errorf(codes.NotFound, "user with ID %d not found", req.UserId)
+		}
+		if strings.Contains(errMsg, "Forbidden") || strings.Contains(errMsg, "permission") {
+			// Assuming GetUserByID service logic returns specific permission error messages
+			return nil, status.Errorf(codes.PermissionDenied, "permission denied to view user %d: %v", req.UserId, err)
+		}
+		// Log internal errors for debugging
+		// s.logger.Errorf("Failed to get user %d: %v", req.UserId, err)
+		return nil, status.Errorf(codes.Internal, "internal error fetching user %d", req.UserId)
 	}
 	return modelToProtoUser(user), nil
 }
 
 // ListUsers is the gRPC handler for listing users.
 func (s *userServiceServer) ListUsers(ctx context.Context, req *userpb.ListUsersRequest) (*userpb.ListUsersResponse, error) {
+	// TODO: Extract requesting user ID from context (gRPC metadata/interceptor)
 	requestingUserID := uint(0) // Simplified for example
 
 	page, pageSize := int(req.Page), int(req.PageSize)
@@ -67,8 +82,12 @@ func (s *userServiceServer) ListUsers(ctx context.Context, req *userpb.ListUsers
 
 	users, total, err := s.userService.ListUsers(page, pageSize, requestingUserID)
 	if err != nil {
-		// Convert service errors to gRPC errors
-		return nil, err
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "Forbidden") || strings.Contains(errMsg, "permission") {
+			return nil, status.Errorf(codes.PermissionDenied, "permission denied to list users: %v", err)
+		}
+		// s.logger.Errorf("Failed to list users: %v", err)
+		return nil, status.Errorf(codes.Internal, "internal error listing users")
 	}
 
 	protoUsers := make([]*userpb.User, len(users))

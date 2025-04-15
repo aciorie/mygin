@@ -8,3 +8,11 @@ A basic project using Gin framework and restful style. Try to learn and improve 
 - Created a simple in-memory service registry.
 - Updated the configuration to include gRPC port and JWT secret.
 - Modified `main.go` to start both gRPC and go-restful servers simultaneously and handle graceful shutdown.
+
+
+# Update Log v0.2.2
+
+- Standardized error handling (gRPC status codes).
+- Integrated logging (Zap).
+- Implemented service self-registration.
+- Cleaned up old code.

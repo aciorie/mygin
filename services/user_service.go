@@ -6,10 +6,10 @@ import (
 	"mygin-restful/auth"
 	"mygin-restful/models"
 	"mygin-restful/repositories"
-	"net/http"
+	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
@@ -41,7 +41,8 @@ type UpdateUserInput struct {
 // The userService structure is the implementation of the UserService interface
 type userService struct {
 	// db *gorm.DB
-	repo repositories.UserRepository
+	repo   repositories.UserRepository
+	logger *zap.SugaredLogger // Add logger
 }
 
 type UserResponse struct {
@@ -60,28 +61,33 @@ type PaginatedUsersResponse struct {
 	PageSize int            `json:"page_size"`
 }
 
+// Ensure userService implements UserService
 var _ UserService = (*userService)(nil)
 
 // NewUserService creates a new UserService instance
-func NewUserService(repo repositories.UserRepository) UserService {
-	return &userService{repo: repo}
+func NewUserService(repo repositories.UserRepository, logger *zap.SugaredLogger) UserService {
+	return &userService{
+		repo:   repo,
+		logger: logger,
+	}
 }
 
 // CreateUser handles the creation of a new user.
 // Permissions: None (public registration assumed) or specific ("users:create")
 func (s *userService) CreateUser(input *CreateUserInput) (*models.User, error) {
-	// Size 1 buffer to avoid blocking goroutine if main thread isn't ready
+	s.logger.Infow("Service: Attempting to create user", "username", input.Username)
 	errChanUsername, errChanEmail := make(chan error, 1), make(chan error, 1)
 
 	// Goroutine for username check
 	go func() {
 		_, err := s.repo.FindByUsername(input.Username)
-		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			errChanUsername <- fmt.Errorf("db error checking username: %w", err) // Send actual DB error
-		} else if err == nil {
-			errChanUsername <- errors.New("Username already exists") // Send conflict error
+		if err == nil {
+			errChanUsername <- errors.New("Username already exists") // Conflict
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			s.logger.Errorw("Service: DB error checking username", "username", input.Username, "error", err)
+			errChanUsername <- fmt.Errorf("internal error checking username") // Generic internal error
 		} else {
-			errChanUsername <- nil // Indicate success (not found)
+			errChanUsername <- nil // Username is available
 		}
 	}()
 
@@ -90,33 +96,36 @@ func (s *userService) CreateUser(input *CreateUserInput) (*models.User, error) {
 	if emailCheckNeeded {
 		go func() {
 			_, err := s.repo.FindByEmail(input.Email)
-			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-				errChanEmail <- fmt.Errorf("db error checking email: %w", err) // Send actual DB error
-			} else if err == nil {
-				errChanEmail <- errors.New("Email already exists") // Send conflict error
+			if err == nil {
+				errChanEmail <- errors.New("Email already exists") // Conflict
+			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+				s.logger.Errorw("Service: DB error checking email", "email", input.Email, "error", err)
+				errChanEmail <- fmt.Errorf("internal error checking email") // Generic internal error
 			} else {
-				errChanEmail <- nil // Indicate success (not found)
+				errChanEmail <- nil // Email is available or not provided
 			}
 		}()
 	}
 
-	// Wait for results
+	// Wait for username check
 	usernameErr := <-errChanUsername
 	if usernameErr != nil {
-		return nil, usernameErr
+		return nil, usernameErr // Return conflict or internal error
 	}
 
+	// Wait for email check if needed
 	if emailCheckNeeded {
 		emailErr := <-errChanEmail
 		if emailErr != nil {
-			return nil, emailErr
+			return nil, emailErr // Return conflict or internal error
 		}
 	}
 
 	// Hash password
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
 	if err != nil {
-		return nil, errors.New("Could not hash password")
+		s.logger.Errorw("Service: Failed to hash password", "username", input.Username, "error", err)
+		return nil, errors.New("could not process password") // More generic internal error
 	}
 
 	user := models.User{
@@ -124,349 +133,405 @@ func (s *userService) CreateUser(input *CreateUserInput) (*models.User, error) {
 		Password: string(hashedPassword),
 		Email:    input.Email,
 		Nickname: input.Nickname,
+		// Assign default role "user" upon creation? Requires fetching role.
 	}
 
-	// Create user
+	// Create user in DB
 	err = s.repo.Create(&user)
 	if err != nil {
-		return nil, errors.New("Failed to create user: " + err.Error())
+		s.logger.Errorw("Service: Failed to create user in repository", "username", input.Username, "error", err)
+		// Could check for specific DB errors (like duplicate key if concurrent check failed somehow)
+		return nil, errors.New("failed to save user") // Generic internal error
 	}
 
-	return &user, nil // Return the created user details (excluding password)
+	s.logger.Infow("Service: User created successfully", "user_id", user.ID, "username", user.Username)
+	return &user, nil
 }
 
 // GetUserByID retrieves a single user by their ID.
 // Permissions: "users:read:self" or "users:read:all"
 func (s *userService) GetUserByID(targetUserID uint, requestingUserID uint) (*models.User, error) {
-	// Channels to receive results from goroutines
-	permissionChan := make(chan struct {
-		canReadSelf bool
-		canReadAny  bool
-		err         error
-	}, 1)
-	userChan := make(chan struct {
+	s.logger.Infow("Service: Attempting to get user by ID", "target_user_id", targetUserID, "requesting_user_id", requestingUserID)
+	// Check if requesting user exists (important for permission checks)
+	if requestingUserID != 0 { // Skip check for internal calls represented by ID 0
+		_, err := s.repo.FindByID(requestingUserID)
+		if err != nil {
+			s.logger.Warnw("Service: Requesting user not found for GetUserByID", "requesting_user_id", requestingUserID, "target_user_id", targetUserID, "error", err)
+			return nil, errors.New("requesting user invalid")
+		}
+	}
+
+	// --- Permission Check (Concurrent) ---
+	// CORRECTED: Struct definition seems okay, the population and usage were likely the issue.
+	type permResult struct {
+		canReadSelf bool  // Boolean field for self-read permission
+		canReadAny  bool  // Boolean field for any-read permission
+		err         error // Single error field
+	}
+	permissionChan := make(chan permResult, 1)
+
+	go func() {
+		// CORRECTED: Assign results to the correct fields
+		var result permResult
+		result.canReadAny, result.err = auth.UserHasPermissions(requestingUserID, "users:read:all")
+		// Only check self permission if the first check didn't already fail fatally
+		if result.err == nil {
+			var errSelf error
+			result.canReadSelf, errSelf = auth.UserHasPermissions(requestingUserID, "users:read:self")
+			result.err = errors.Join(result.err, errSelf) // Combine potential errors (join nil is safe)
+		}
+		permissionChan <- result
+	}()
+
+	// --- Fetch User (Concurrent) --- remains the same
+	type userResult struct {
 		user *models.User
 		err  error
-	}, 1)
-
-	// Goroutine for permission checks
-	go func() {
-		canReadAny, err := auth.UserHasPermissions(requestingUserID, "users:read:all")
-		if err != nil {
-			permissionChan <- struct {
-				canReadSelf bool
-				canReadAny  bool
-				err         error
-			}{canReadSelf: false, canReadAny: false, err: err}
-			return
-		}
-		canReadSelf, err := auth.UserHasPermissions(requestingUserID, "users:read:self")
-		permissionChan <- struct {
-			canReadSelf bool
-			canReadAny  bool
-			err         error
-		}{canReadSelf: canReadSelf, canReadAny: canReadAny, err: err}
-	}()
-
-	// Goroutine for fetching user
+	}
+	userChan := make(chan userResult, 1)
 	go func() {
 		user, err := s.repo.FindByID(targetUserID)
-		userChan <- struct {
-			user *models.User
-			err  error
-		}{user: user, err: err}
+		userChan <- userResult{user: user, err: err}
 	}()
 
-	// Await results from channels
-	permissions := <-permissionChan
-	userResult := <-userChan
+	// Await results
+	perms := <-permissionChan
+	uResult := <-userChan
 
-	// Handle errors from goroutines
-	if permissions.err != nil {
-		return nil, fmt.Errorf("permission check failed: %w", permissions.err)
-	}
-	if userResult.err != nil {
-		if errors.Is(userResult.err, gorm.ErrRecordNotFound) {
-			return nil, errors.New("User not found")
+	// Handle errors - **FIRST check for errors from the goroutines**
+	if perms.err != nil {
+		// Check if it's just "user not found" for the *requesting* user
+		if requestingUserID != 0 && strings.Contains(perms.err.Error(), fmt.Sprintf("user with ID %d not found", requestingUserID)) {
+			s.logger.Warnw("Service: Requesting user vanished during permission check", "requesting_user_id", requestingUserID)
+			return nil, errors.New("requesting user invalid")
 		}
-		return nil, fmt.Errorf("failed to retrieve user: %w", userResult.err)
+		s.logger.Errorw("Service: Permission check failed internally", "requesting_user_id", requestingUserID, "error", perms.err)
+		return nil, fmt.Errorf("internal error during permission check")
+	}
+	if uResult.err != nil {
+		if errors.Is(uResult.err, gorm.ErrRecordNotFound) {
+			return nil, errors.New("User not found") // Use specific error message
+		}
+		s.logger.Errorw("Service: Failed to retrieve target user", "target_user_id", targetUserID, "error", uResult.err)
+		return nil, fmt.Errorf("failed to retrieve user")
 	}
 
-	isSelf := uint(targetUserID) == requestingUserID
-	if !((isSelf && permissions.canReadSelf) || (!isSelf && permissions.canReadAny)) {
+	// Check permissions based on results - **NOW use the boolean fields**
+	isSelf := targetUserID == requestingUserID
+	s.logger.Debugw("Service: Permission check values", "is_self", isSelf, "can_read_self", perms.canReadSelf, "can_read_any", perms.canReadAny)
+
+	// CORRECTED: Access boolean fields directly
+	if !((isSelf && perms.canReadSelf) || (!isSelf && perms.canReadAny)) {
+		if isSelf && !perms.canReadSelf { // Check specific self-read denial
+			return nil, errors.New("Forbidden: You need 'users:read:self' permission to view your own profile")
+		}
 		return nil, errors.New("Forbidden: You need 'users:read:all' permission to view other profiles")
 	}
 
-	return userResult.user, nil
+	s.logger.Infow("Service: User retrieved successfully", "target_user_id", targetUserID)
+	return uResult.user, nil
 }
 
 // UpdateUser updates a user's details.
 // Permissions: "users:update:self" or "users:update:all"
 func (s *userService) UpdateUser(targetUserID uint, requestingUserID uint, input *UpdateUserInput) (*models.User, error) {
-	// Channels for concurrent operations
-	permissionChan := make(chan struct {
-		canUpdateAny bool
-		err          error
-	}, 1)
-	userChan := make(chan struct {
+	s.logger.Infow("Service: Attempting to update user", "target_user_id", targetUserID, "requesting_user_id", requestingUserID)
+	// Check if requesting user exists first (as in GetUserByID)
+	if requestingUserID != 0 {
+		_, err := s.repo.FindByID(requestingUserID)
+		if err != nil {
+			s.logger.Warnw("Service: Requesting user not found for UpdateUser", "requesting_user_id", requestingUserID, "target_user_id", targetUserID, "error", err)
+			return nil, errors.New("requesting user invalid")
+		}
+	}
+
+	// --- Permission Check (Concurrent) ---
+	type permResult struct { // Define struct specific to update permissions needed
+		canUpdateSelf bool
+		canUpdateAny  bool
+		err           error
+	}
+	permissionChan := make(chan permResult, 1)
+	go func() {
+		// CORRECTED: Assign to correct fields
+		var result permResult
+		result.canUpdateAny, result.err = auth.UserHasPermissions(requestingUserID, "users:update:all")
+		if result.err == nil {
+			var errSelf error
+			result.canUpdateSelf, errSelf = auth.UserHasPermissions(requestingUserID, "users:update:self")
+			result.err = errors.Join(result.err, errSelf)
+		}
+		permissionChan <- result
+	}()
+
+	// --- Fetch Target User (Concurrent) --- remains the same
+	type userResult struct {
 		user *models.User
 		err  error
-	}, 1)
-	emailChan := make(chan struct {
-		existingUser *models.User
-		err          error
-	}, 1)
-
-	// Launch goroutines
-	go func() {
-		canUpdateAny, err := auth.UserHasPermissions(requestingUserID, "users:update:all")
-		permissionChan <- struct {
-			canUpdateAny bool
-			err          error
-		}{canUpdateAny: canUpdateAny, err: err}
-	}()
+	}
+	userChan := make(chan userResult, 1)
 	go func() {
 		user, err := s.repo.FindByID(targetUserID)
-		userChan <- struct {
-			user *models.User
-			err  error
-		}{
-			user: user,
-			err:  err,
-		}
+		userChan <- userResult{user: user, err: err}
 	}()
 
-	// Email check goroutine (only if email is being updated)
-	if input.Email != nil {
+	// --- Check Email Conflict (Concurrent, if email provided) --- remains the same
+	type emailResult struct {
+		existingUser *models.User
+		err          error
+	}
+	emailChan := make(chan emailResult, 1)
+	if input.Email != nil && *input.Email != "" {
 		go func() {
 			existingUser, err := s.repo.FindByEmail(*input.Email)
-			emailChan <- struct {
-				existingUser *models.User
-				err          error
-			}{existingUser: existingUser, err: err}
+			emailChan <- emailResult{existingUser: existingUser, err: err}
 		}()
 	} else {
-		// Send a nil result immediately if no email update is happening
-		emailChan <- struct {
-			existingUser *models.User
-			err          error
-		}{existingUser: nil, err: nil}
+		emailChan <- emailResult{existingUser: nil, err: nil}
 	}
 
 	// Await results
-	permissions := <-permissionChan
-	userResult := <-userChan
-	emailResult := <-emailChan
+	perms := <-permissionChan
+	uResult := <-userChan
+	eResult := <-emailChan
 
-	// Error handling
-	if permissions.err != nil {
-		return nil, fmt.Errorf("permission check failed: %w", permissions.err)
+	// Handle errors - **Check errors first**
+	if perms.err != nil {
+		if requestingUserID != 0 && strings.Contains(perms.err.Error(), fmt.Sprintf("user with ID %d not found", requestingUserID)) {
+			s.logger.Warnw("Service: Requesting user vanished during update permission check", "requesting_user_id", requestingUserID)
+			return nil, errors.New("requesting user invalid")
+		}
+		s.logger.Errorw("Service: Update permission check failed internally", "requesting_user_id", requestingUserID, "error", perms.err)
+		return nil, fmt.Errorf("internal error during permission check")
 	}
-	if userResult.err != nil {
-		if errors.Is(userResult.err, gorm.ErrRecordNotFound) {
+	if uResult.err != nil {
+		if errors.Is(uResult.err, gorm.ErrRecordNotFound) {
 			return nil, errors.New("User not found")
 		}
-		return nil, fmt.Errorf("failed to retrieve user: %w", userResult.err)
+		s.logger.Errorw("Service: Failed to retrieve target user for update", "target_user_id", targetUserID, "error", uResult.err)
+		return nil, fmt.Errorf("failed to retrieve user for update")
+	}
+	if input.Email != nil && eResult.err != nil && !errors.Is(eResult.err, gorm.ErrRecordNotFound) {
+		// DB error during email check
+		s.logger.Errorw("Service: DB error checking email uniqueness for update", "email", *input.Email, "error", eResult.err)
+		return nil, errors.New("internal error checking email uniqueness")
 	}
 
-	// Permission check
-	isSelf := uint(targetUserID) == requestingUserID
-	if !isSelf && !permissions.canUpdateAny {
-		return nil, errors.New("Forbidden: You can only update your own profile or require 'users:update:all' permission")
+	// Check permissions - **Use boolean fields**
+	isSelf := targetUserID == requestingUserID
+	s.logger.Debugw("Service: Update permission check values", "is_self", isSelf, "can_update_self", perms.canUpdateSelf, "can_update_any", perms.canUpdateAny)
+
+	// CORRECTED: Access boolean fields
+	if !((isSelf && perms.canUpdateSelf) || (!isSelf && perms.canUpdateAny)) {
+		if isSelf && !perms.canUpdateSelf {
+			return nil, errors.New("Forbidden: You need 'users:update:self' permission to update your own profile")
+		}
+		return nil, errors.New("Forbidden: You need 'users:update:all' permission to update other profiles")
 	}
 
-	user := userResult.user
-
-	// --- Update Fields ---
+	user := uResult.user
 	needsSave := false
 
-	// Update Email
+	// Validate and Update Email - **Check for conflict using awaited result**
 	if input.Email != nil {
-		if emailResult.err == nil && emailResult.existingUser.ID != user.ID {
+		// Use the result from the channel 'eResult'
+		if eResult.existingUser != nil && eResult.existingUser.ID != user.ID {
+			// Email conflict
 			return nil, errors.New("Email address is already in use by another account")
-		} else if !errors.Is(emailResult.err, gorm.ErrRecordNotFound) {
-			return nil, errors.New("Database error checking email uniqueness")
 		}
-
+		// Only update if the email is actually different
 		if user.Email != *input.Email {
 			user.Email = *input.Email
 			needsSave = true
+			s.logger.Debugw("Service: Updating email", "user_id", user.ID, "new_email", *input.Email)
 		}
 	}
 
+	// ... (Update Nickname, Password remain the same) ...
 	// Update Nickname
 	if input.Nickname != nil && user.Nickname != *input.Nickname {
 		user.Nickname = *input.Nickname
 		needsSave = true
+		s.logger.Debugw("Service: Updating nickname", "user_id", user.ID, "new_nickname", *input.Nickname)
 	}
 
 	// Update Password
 	if input.Password != nil {
+		if len(*input.Password) < 6 { // Example validation
+			return nil, errors.New("password must be at least 6 characters long") // Bad request type error
+		}
 		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(*input.Password), bcrypt.DefaultCost)
 		if err != nil {
-			return nil, errors.New("Could not hash new password")
+			s.logger.Errorw("Service: Failed to hash new password during update", "user_id", user.ID, "error", err)
+			return nil, errors.New("could not process new password")
 		}
 		user.Password = string(hashedPassword)
 		needsSave = true
+		s.logger.Debugw("Service: Updating password", "user_id", user.ID)
 	}
 
-	// Save changes if any fields were updated
+	// Save if changes were made
 	if needsSave {
+		s.logger.Infow("Service: Saving updated user data", "user_id", user.ID)
 		if err := s.repo.Update(user); err != nil {
-			return nil, errors.New("Failed to save user updates: " + err.Error())
+			s.logger.Errorw("Service: Failed to save user updates in repository", "user_id", user.ID, "error", err)
+			return nil, errors.New("failed to save user updates")
 		}
+	} else {
+		s.logger.Infow("Service: No fields needed updating", "user_id", user.ID)
 	}
 
-	// Return updated user data (potentially re-fetch to get updated associations like roles if changed)
-	updatedUser, err := s.repo.FindByID(user.ID)
-	if err != nil {
-		return nil, err
-	}
-
-	return updatedUser, nil
+	return user, nil
 }
 
 // ListUsers retrieves a paginated list of users.
 // Permissions: "users:list"
 func (s *userService) ListUsers(page int, pageSize int, requestingUserID uint) ([]models.User, int64, error) {
-	// Channels for concurrent operations
-	permissionChan := make(chan struct {
+	s.logger.Infow("Service: Attempting to list users", "requesting_user_id", requestingUserID, "page", page, "page_size", pageSize)
+	// Check if requesting user exists first
+	if requestingUserID != 0 {
+		_, err := s.repo.FindByID(requestingUserID)
+		if err != nil {
+			s.logger.Warnw("Service: Requesting user not found for ListUsers", "requesting_user_id", requestingUserID, "error", err)
+			return nil, 0, errors.New("requesting user invalid")
+		}
+	}
+
+	// --- Permission Check (Concurrent) ---
+	type permResult struct { // Struct specific to list permission
 		canList bool
 		err     error
-	}, 1)
-	usersChan := make(chan struct {
+	}
+	permissionChan := make(chan permResult, 1)
+	go func() {
+		// CORRECTED: Assign to correct fields
+		var result permResult
+		result.canList, result.err = auth.UserHasPermissions(requestingUserID, "users:list")
+		permissionChan <- result
+	}()
+
+	// --- Fetch Users (Concurrent) --- remains the same
+	type usersResult struct {
 		users []models.User
 		total int64
 		err   error
-	}, 1)
-
-	// Launch goroutines
-	go func() {
-		canList, err := auth.UserHasPermissions(requestingUserID, "users:list")
-		permissionChan <- struct {
-			canList bool
-			err     error
-		}{canList: canList, err: err}
-	}()
-
+	}
+	usersChan := make(chan usersResult, 1)
 	go func() {
 		users, total, err := s.repo.FindAll(page, pageSize)
-		usersChan <- struct {
-			users []models.User
-			total int64
-			err   error
-		}{users: users, total: total, err: err}
+		usersChan <- usersResult{users: users, total: total, err: err}
 	}()
 
 	// Await results
-	permissions := <-permissionChan
-	usersResult := <-usersChan
+	perms := <-permissionChan
+	uResult := <-usersChan
 
-	// Error handling
-	if permissions.err != nil {
-		return nil, 0, fmt.Errorf("permission check failed: %w", permissions.err)
+	// Handle errors - **Check errors first**
+	if perms.err != nil {
+		if requestingUserID != 0 && strings.Contains(perms.err.Error(), fmt.Sprintf("user with ID %d not found", requestingUserID)) {
+			s.logger.Warnw("Service: Requesting user vanished during list permission check", "requesting_user_id", requestingUserID)
+			return nil, 0, errors.New("requesting user invalid")
+		}
+		s.logger.Errorw("Service: List permission check failed internally", "requesting_user_id", requestingUserID, "error", perms.err)
+		return nil, 0, fmt.Errorf("internal error during permission check")
 	}
-	if !permissions.canList {
+	if uResult.err != nil {
+		s.logger.Errorw("Service: Failed to retrieve users from repository", "error", uResult.err)
+		return nil, 0, fmt.Errorf("failed to retrieve users")
+	}
+
+	// Check permissions - **Use boolean field**
+	// CORRECTED: Access boolean field
+	if !perms.canList {
 		return nil, 0, errors.New("Forbidden: You need 'users:list' permission")
 	}
-	if usersResult.err != nil {
-		return nil, 0, fmt.Errorf("failed to retrieve users: %w", usersResult.err)
-	}
 
-	return usersResult.users, usersResult.total, nil
+	s.logger.Infow("Service: Users listed successfully", "count", len(uResult.users), "total", uResult.total)
+	return uResult.users, uResult.total, nil
 }
 
 // DeleteUser Delete user information based on user ID
-func (s *userService) DeleteUser(userID uint, requestingUserID uint) error {
-	// Channels for concurrent operations
-	permissionChan := make(chan struct {
+func (s *userService) DeleteUser(targetUserID uint, requestingUserID uint) error {
+	s.logger.Infow("Service: Attempting to delete user", "target_user_id", targetUserID, "requesting_user_id", requestingUserID)
+	// Check if requesting user exists first
+	if requestingUserID != 0 {
+		_, err := s.repo.FindByID(requestingUserID)
+		if err != nil {
+			s.logger.Warnw("Service: Requesting user not found for DeleteUser", "requesting_user_id", requestingUserID, "error", err)
+			return errors.New("requesting user invalid")
+		}
+	}
+
+	// --- Permission Check (Concurrent) ---
+	type permResult struct { // Struct specific to delete permissions
 		canDeleteSelf bool
 		canDeleteAny  bool
 		err           error
-	}, 1)
-	userChan := make(chan struct {
-		user *models.User
-		err  error
-	}, 1)
-
-	// Launch goroutines
+	}
+	permissionChan := make(chan permResult, 1)
 	go func() {
-		canDeleteAny, err := auth.UserHasPermissions(requestingUserID, "users:delete:all")
-		if err != nil {
-			permissionChan <- struct {
-				canDeleteSelf bool
-				canDeleteAny  bool
-				err           error
-			}{canDeleteSelf: false, canDeleteAny: false, err: err}
-			return
+		// CORRECTED: Assign to correct fields
+		var result permResult
+		result.canDeleteAny, result.err = auth.UserHasPermissions(requestingUserID, "users:delete:all")
+		if result.err == nil {
+			var errSelf error
+			result.canDeleteSelf, errSelf = auth.UserHasPermissions(requestingUserID, "users:delete:self")
+			result.err = errors.Join(result.err, errSelf)
 		}
-		canDeleteSelf, err := auth.UserHasPermissions(requestingUserID, "users:delete:self")
-		permissionChan <- struct {
-			canDeleteSelf bool
-			canDeleteAny  bool
-			err           error
-		}{canDeleteSelf: canDeleteSelf, canDeleteAny: canDeleteAny, err: err}
+		permissionChan <- result
 	}()
 
+	// --- Fetch User (Concurrent) --- remains the same
+	type userResult struct {
+		user *models.User
+		err  error
+	}
+	userChan := make(chan userResult, 1)
 	go func() {
-		user, err := s.repo.FindByID(userID)
-		userChan <- struct {
-			user *models.User
-			err  error
-		}{user: user, err: err}
+		user, err := s.repo.FindByID(targetUserID)
+		userChan <- userResult{user: user, err: err}
 	}()
 
 	// Await results
-	permissions := <-permissionChan
-	userResult := <-userChan
+	perms := <-permissionChan
+	uResult := <-userChan
 
-	// Error handling
-	if permissions.err != nil {
-		return fmt.Errorf("permission check failed: %w", permissions.err)
-	}
-	if userResult.err != nil {
-		if errors.Is(userResult.err, gorm.ErrRecordNotFound) {
-			return errors.New("User not exist")
+	// Handle errors - **Check errors first**
+	if perms.err != nil {
+		if requestingUserID != 0 && strings.Contains(perms.err.Error(), fmt.Sprintf("user with ID %d not found", requestingUserID)) {
+			s.logger.Warnw("Service: Requesting user vanished during delete permission check", "requesting_user_id", requestingUserID)
+			return errors.New("requesting user invalid")
 		}
-		return fmt.Errorf("failed to retrieve user: %w", userResult.err)
+		s.logger.Errorw("Service: Delete permission check failed internally", "requesting_user_id", requestingUserID, "error", perms.err)
+		return fmt.Errorf("internal error during permission check")
+	}
+	if uResult.err != nil {
+		if errors.Is(uResult.err, gorm.ErrRecordNotFound) {
+			return errors.New("User not found")
+		}
+		s.logger.Errorw("Service: Failed to retrieve target user for delete", "target_user_id", targetUserID, "error", uResult.err)
+		return fmt.Errorf("failed to retrieve user for delete")
 	}
 
-	// Permission check
-	isSelf := userID == requestingUserID
-	if !((isSelf && permissions.canDeleteSelf) || (!isSelf && permissions.canDeleteAny)) {
-		return errors.New("No permission to delete this user information")
+	// Check permissions - **Use boolean fields**
+	isSelf := targetUserID == requestingUserID
+	s.logger.Debugw("Service: Delete permission check values", "is_self", isSelf, "can_delete_self", perms.canDeleteSelf, "can_delete_any", perms.canDeleteAny)
+
+	// CORRECTED: Access boolean fields
+	if !((isSelf && perms.canDeleteSelf) || (!isSelf && perms.canDeleteAny)) {
+		if isSelf && !perms.canDeleteSelf {
+			return errors.New("Forbidden: You need 'users:delete:self' permission to delete your own profile")
+		}
+		return errors.New("Forbidden: You need 'users:delete:all' permission to delete other profiles")
 	}
 
-	// Deleting User Information
-	err := s.repo.Delete(userResult.user)
+	// Perform deletion
+	err := s.repo.Delete(uResult.user)
 	if err != nil {
-		return fmt.Errorf("Failed to delete user information: %w", err)
+		s.logger.Errorw("Service: Failed to delete user from repository", "target_user_id", targetUserID, "error", err)
+		return fmt.Errorf("failed to delete user")
 	}
 
+	s.logger.Infow("Service: User deleted successfully", "target_user_id", targetUserID)
 	return nil
-}
-
-func mapUserToResponse(user models.User) UserResponse {
-	return UserResponse{
-		ID:        user.ID,
-		Username:  user.Username,
-		Email:     user.Email,
-		Nickname:  user.Nickname,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-	}
-}
-
-func getUserFromContext(c *gin.Context) (uint, bool) {
-	userIDAny, exists := c.Get("user_id")
-	if !exists {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"message": "User ID not found in context"})
-		return 0, false
-	}
-	userID, ok := userIDAny.(uint)
-	if !ok {
-		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"message": "User ID context type assertion failed"})
-		return 0, false
-	}
-	return userID, true
 }
