@@ -16,3 +16,12 @@ A basic project using Gin framework and restful style. Try to learn and improve 
 - Integrated logging (Zap).
 - Implemented service self-registration.
 - Cleaned up old code.
+
+
+# Update Log v0.2.3
+- Replaced in-memory service registry with Consul integration (hashicorp/consul/api).
+- Implemented service self-registration/deregistration to Consul with health checks (main.go).
+- Added standard gRPC health check service (google.golang.org/grpc/health).
+- Added gRPC interceptors (go-grpc-middleware) for Zap logging and JWT authentication.
+- Updated gRPC handlers to use user info from context provided by auth interceptor.
+- Added Consul configuration options (config/config.yaml, config.go).

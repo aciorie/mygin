@@ -7,6 +7,10 @@ import (
 	"github.com/spf13/viper"
 )
 
+type ConsulConfig struct {
+	Address string `mapstructure:"address"`
+}
+
 type Config struct {
 	HTTPPort    int    `mapstructure:"http_port"` // Renamed from port
 	GRPCPort    int    `mapstructure:"grpc_port"`
@@ -14,7 +18,8 @@ type Config struct {
 	DatabaseURL string `mapstructure:"database_url"`
 	ServiceName string `mapstructure:"service_name"` // Added for registration
 	// Add JWT Secret Key here instead of hardcoding
-	JwtSecret string `mapstructure:"jwt_secret"`
+	JwtSecret string       `mapstructure:"jwt_secret"`
+	Consul    ConsulConfig `mapstructure:"consul"` // Added Consul config
 }
 
 var AppConfig Config
@@ -36,6 +41,8 @@ func InitConfig() {
 	viper.SetDefault("log_level", "info")
 	viper.SetDefault("service_name", "user-center")
 	viper.SetDefault("jwt_secret", "default-very-insecure-secret-key") // CHANGE THIS IN PRODUCTION
+	// --- Added Consul default ---
+	viper.SetDefault("consul.address", "127.0.0.1:8500")
 
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); ok {

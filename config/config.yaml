@@ -1,3 +1,4 @@
+# config/config.yaml
 http_port: 8080
 grpc_port: 50051
 log_level: info
@@ -6,3 +7,9 @@ database_url: "root:1q2w3E4!@tcp(localhost:3306)/mygin?charset=utf8mb4&parseTime
 service_name: "user-center"
 # IMPORTANT: Set a strong, unique secret via ENV VAR or secure config management in production
 jwt_secret: "justforlearningthanks" # Replace this default!
+
+# --- Added for Consul ---
+consul:
+  address: "127.0.0.1:8500" # Default Consul agent address
+  # You might add other Consul configs here later (token, scheme, etc.)
+# -----------------------

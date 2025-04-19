@@ -3,6 +3,7 @@ package grpcserver
 import (
 	"context"
 	"errors"
+	"mygin-restful/interceptors"
 	"mygin-restful/models"
 	userpb "mygin-restful/proto/user" // Import generated user proto
 	"mygin-restful/services"
@@ -44,21 +45,26 @@ func modelToProtoUser(u *models.User) *userpb.User {
 
 // GetUser is the gRPC handler for retrieving a user.
 func (s *userServiceServer) GetUser(ctx context.Context, req *userpb.GetUserRequest) (*userpb.User, error) {
-	// TODO: Extract requesting user ID from context (gRPC metadata/interceptor)
-	// An interceptor should validate the incoming token (from metadata) and
-	// inject the user ID into the context.
-	// For now, using 0 implies internal call or requires separate permission check.
-	requestingUserID := uint(0) // Simplified for example
+	// --- Retrieve requesting user ID from context injected by interceptor ---
+	requestingUserID, ok := interceptors.GetUserIDFromContext(ctx)
+	if !ok {
+		// This should ideally not happen if AuthInterceptor runs correctly for non-public methods
+		// Log error, maybe return Internal? Or Unauthenticated? Depends on policy.
+		// s.logger.Error("Failed to get user ID from context in GetUser handler")
+		return nil, status.Error(codes.Internal, "could not identify requesting user from context")
+	}
+	// --- End Context Retrieval ---
 
-	user, err := s.userService.GetUserByID(uint(req.UserId), requestingUserID)
+	// Now use the actual requestingUserID for the service call
+	user, err := s.userService.GetUserByID(uint(req.UserId), requestingUserID) // Pass the real ID
 	if err != nil {
 		errMsg := err.Error()
 		if errors.Is(err, gorm.ErrRecordNotFound) || strings.Contains(errMsg, "not found") {
 			return nil, status.Errorf(codes.NotFound, "user with ID %d not found", req.UserId)
 		}
+		// Use the actual error message for permission denied
 		if strings.Contains(errMsg, "Forbidden") || strings.Contains(errMsg, "permission") {
-			// Assuming GetUserByID service logic returns specific permission error messages
-			return nil, status.Errorf(codes.PermissionDenied, "permission denied to view user %d: %v", req.UserId, err)
+			return nil, status.Errorf(codes.PermissionDenied, errMsg) // Return the specific message
 		}
 		// Log internal errors for debugging
 		// s.logger.Errorf("Failed to get user %d: %v", req.UserId, err)
@@ -69,8 +75,12 @@ func (s *userServiceServer) GetUser(ctx context.Context, req *userpb.GetUserRequ
 
 // ListUsers is the gRPC handler for listing users.
 func (s *userServiceServer) ListUsers(ctx context.Context, req *userpb.ListUsersRequest) (*userpb.ListUsersResponse, error) {
-	// TODO: Extract requesting user ID from context (gRPC metadata/interceptor)
-	requestingUserID := uint(0) // Simplified for example
+	// Retrieve requesting user ID from context
+	requestingUserID, ok := interceptors.GetUserIDFromContext(ctx)
+	if !ok {
+		// s.logger.Error("Failed to get user ID from context in ListUsers handler")
+		return nil, status.Error(codes.Internal, "could not identify requesting user from context")
+	}
 
 	page, pageSize := int(req.Page), int(req.PageSize)
 	if page < 1 {
@@ -80,11 +90,13 @@ func (s *userServiceServer) ListUsers(ctx context.Context, req *userpb.ListUsers
 		pageSize = 10
 	}
 
+	// Use the actual requestingUserID
 	users, total, err := s.userService.ListUsers(page, pageSize, requestingUserID)
 	if err != nil {
 		errMsg := err.Error()
+		// Use the actual error message for permission denied
 		if strings.Contains(errMsg, "Forbidden") || strings.Contains(errMsg, "permission") {
-			return nil, status.Errorf(codes.PermissionDenied, "permission denied to list users: %v", err)
+			return nil, status.Errorf(codes.PermissionDenied, errMsg)
 		}
 		// s.logger.Errorf("Failed to list users: %v", err)
 		return nil, status.Errorf(codes.Internal, "internal error listing users")

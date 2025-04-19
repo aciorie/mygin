@@ -1,67 +1,27 @@
 package registry
 
 import (
-	"fmt"
-	"sync"
+	consulapi "github.com/hashicorp/consul/api"
 )
 
 // ServiceRegistry defines the interface for service registration and discovery.
 type ServiceRegistry interface {
-	Register(name, address string) error
-	Deregister(name string) error
-	Discover(name string) (string, error)
-	List() map[string]string
-}
+	// Register registers a specific service instance with Consul.
+	// id: Unique identifier for this instance (e.g., serviceName + hostname + port).
+	// name: Logical name of the service (e.g., "user-center-grpc").
+	// address: IP or hostname where the service listens.
+	// port: Port number where the service listens.
+	// tags: Optional tags for filtering.
+	// check: Health check configuration.
+	Register(id, name, address string, port int, tags []string, check *consulapi.AgentServiceCheck) error
 
-// inMemoryRegistry is a simple in-memory implementation.
-type inMemoryRegistry struct {
-	mu       sync.RWMutex
-	services map[string]string // service name -> address
-}
+	// Deregister removes a service instance using its unique ID.
+	Deregister(id string) error
 
-// NewInMemoryRegistry creates a new in-memory registry.
-func NewInMemoryRegistry() ServiceRegistry {
-	return &inMemoryRegistry{
-		services: make(map[string]string),
-	}
-}
+	// Discover finds healthy instances of a service by name and optional tag.
+	// Returns a list of "host:port" strings.
+	Discover(name string, tag string) ([]string, error)
 
-func (r *inMemoryRegistry) Register(name, address string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.services[name] = address
-	fmt.Printf("Registry: Registered service '%s' at '%s'\n", name, address)
-	return nil
-}
-
-func (r *inMemoryRegistry) Deregister(name string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, ok := r.services[name]; !ok {
-		return fmt.Errorf("service '%s' not found", name)
-	}
-	delete(r.services, name)
-	fmt.Printf("Registry: Deregistered service '%s'\n", name)
-	return nil
-}
-
-func (r *inMemoryRegistry) Discover(name string) (string, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	address, ok := r.services[name]
-	if !ok {
-		return "", fmt.Errorf("service '%s' not found", name)
-	}
-	return address, nil
-}
-
-func (r *inMemoryRegistry) List() map[string]string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	// Return a copy to avoid external modification
-	list := make(map[string]string, len(r.services))
-	for k, v := range r.services {
-		list[k] = v
-	}
-	return list
+	// List retrieves a map of service names to some representation (e.g., tags).
+	List() (map[string]string, error)
 }
